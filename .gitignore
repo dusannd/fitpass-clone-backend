@@ -1,0 +1,14 @@
+# Virtuelno okruzenje (PyCharm ga obicno stavi u venv ili .venv)
+venv/
+.venv/
+env/
+
+# PyCharm specifični fajlovi
+.idea/
+
+# Python cache fajlovi
+__pycache__/
+*.py[cod]
+
+# Environment varijable (Tu cemo drzati sifru baze, OVO NE SME NA GITHUB)
+.env
