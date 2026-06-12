@@ -21,9 +21,8 @@ app = FastAPI(
 # --- STARTUP EVENTS ---
 @app.on_event("startup")
 async def startup():
-    # 1. Create database tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # 1. Database table creation is now handled by Alembic migrations.
+    # Base.metadata.create_all is removed.
 
     # 2. Start our background cron jobs
     start_scheduler()
