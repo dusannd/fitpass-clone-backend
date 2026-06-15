@@ -10,7 +10,7 @@ from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
 
 # --- 3. ROUTER IMPORTS ---
-from app.api import users, subscriptions, access, admin
+from app.api import users, subscriptions, access, admin, worker
 
 app = FastAPI(
     title="FitPass Clone / Gym API",
@@ -35,6 +35,8 @@ app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(subscriptions.router, prefix="/api/subscriptions", tags=["Subscriptions"])
 app.include_router(access.router, prefix="/api/access", tags=["Door Access"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin Dashboard"])
+app.include_router(worker.router, prefix="/api/worker", tags=["Desk Worker"])
+
 
 # --- HEALTH CHECK (Placed at the bottom) ---
 @app.get("/health", tags=["System Health"])
