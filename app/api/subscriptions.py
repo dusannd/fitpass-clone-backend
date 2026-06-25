@@ -1,64 +1,141 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 from app.core.database import get_db
-from app.models.subscription import SubscriptionPlan, UserSubscription
-from app.schemas.subscription import PlanCreate, PlanResponse, UserSubscriptionCreate, UserSubscriptionResponse
-from app.api.dependencies import get_current_user_id, get_current_admin
-
+from app.models.subscription import SubscriptionPlan, UserSubscription, GymLocation, SubscriptionRule
+from app.schemas.subscription import (
+    PlanCreate, PlanResponse,
+    UserSubscriptionCreate, UserSubscriptionResponse,
+    GymLocationCreate, GymLocationResponse
+)
+from app.api.dependencies import get_current_user_id, RequireRole
 
 router = APIRouter()
 
+# --- BOUNCERS ---
+get_current_admin = RequireRole("admin")
 
-# --- 1. ADMIN: Create a new Subscription Plan (e.g. Gold, Standard) ---
+
+# ==========================================
+# 1. GYM LOCATIONS (ADMIN ONLY)
+# ==========================================
+@router.post("/locations", response_model=GymLocationResponse)
+async def create_location(
+        location: GymLocationCreate,
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    Admin registers a new physical gym location.
+    """
+    new_location = GymLocation(**location.model_dump())
+    db.add(new_location)
+    await db.commit()
+    await db.refresh(new_location)
+    return new_location
+
+
+@router.get("/locations", response_model=List[GymLocationResponse])
+async def get_locations(db: AsyncSession = Depends(get_db)):
+    """
+    Public route: See all available gym locations.
+    """
+    result = await db.execute(select(GymLocation))
+    return result.scalars().all()
+
+
+# ==========================================
+# 2. SUBSCRIPTION PLANS (ADMIN ONLY)
+# ==========================================
 @router.post("/plans", response_model=PlanResponse)
 async def create_plan(
-    plan: PlanCreate,
-    db: AsyncSession = Depends(get_db),
-    admin_id: int = Depends(get_current_admin) # <--- THE ADMIN BOUNCER IS HERE NOW
+        plan: PlanCreate,
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
 ):
+    """
+    Admin creates a new Subscription Plan (e.g., Student Plan).
+    Assigns allowed locations and time rules dynamically.
+    """
+    # 1. Create the basic plan
     new_plan = SubscriptionPlan(
         name=plan.name,
         description=plan.description,
         price=plan.price,
         duration_days=plan.duration_days
     )
-    db.add(new_plan)
-    await db.commit()
-    await db.refresh(new_plan)
-    return new_plan
 
-# --- 2. PUBLIC: Get all available plans ---
-@router.get("/plans", response_model=list[PlanResponse])
+    # 2. Assign allowed locations (Many-to-Many)
+    if plan.location_ids:
+        loc_result = await db.execute(select(GymLocation).where(GymLocation.id.in_(plan.location_ids)))
+        locations = loc_result.scalars().all()
+        new_plan.locations.extend(locations)
+
+    # 3. Create rules if provided (One-to-One)
+    db.add(new_plan)
+    await db.commit()  # Commit so new_plan gets an ID
+    await db.refresh(new_plan)
+
+    if plan.rule:
+        new_rule = SubscriptionRule(
+            plan_id=new_plan.id,
+            allowed_time_start=plan.rule.allowed_time_start,
+            allowed_time_end=plan.rule.allowed_time_end,
+            allowed_days=plan.rule.allowed_days
+        )
+        db.add(new_rule)
+        await db.commit()
+
+    # 4. Fetch the fully loaded plan to return to the client
+    stmt = select(SubscriptionPlan).options(
+        selectinload(SubscriptionPlan.locations),
+        selectinload(SubscriptionPlan.rule)
+    ).where(SubscriptionPlan.id == new_plan.id)
+
+    final_result = await db.execute(stmt)
+    return final_result.scalars().first()
+
+
+@router.get("/plans", response_model=List[PlanResponse])
 async def get_plans(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(SubscriptionPlan))
+    """
+    Public route: Get all available plans, including their rules and allowed locations.
+    """
+    stmt = select(SubscriptionPlan).options(
+        selectinload(SubscriptionPlan.locations),
+        selectinload(SubscriptionPlan.rule)
+    )
+    result = await db.execute(stmt)
     return result.scalars().all()
 
 
-# --- 3. USER: Subscribe to a plan ---
-# NOTICE: We added Depends(get_current_user_id) here! This route is PROTECTED.
+# ==========================================
+# 3. USER SUBSCRIPTIONS (LOGGED IN USERS)
+# ==========================================
 @router.post("/subscribe", response_model=UserSubscriptionResponse)
 async def subscribe_user(
         subscription: UserSubscriptionCreate,
         db: AsyncSession = Depends(get_db),
-        current_user_id: int = Depends(get_current_user_id)  # <--- THE BOUNCER
+        current_user_id: int = Depends(get_current_user_id)
 ):
-    # Check if the plan exists
+    """
+    User buys a plan.
+    """
     result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == subscription.plan_id))
     plan = result.scalars().first()
 
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    # Calculate start and end dates
     start_date = datetime.now(timezone.utc)
     end_date = start_date + timedelta(days=plan.duration_days)
 
-    # Create the user subscription
     new_sub = UserSubscription(
-        user_id=current_user_id,  # We got this safely from the JWT token!
+        user_id=current_user_id,
         plan_id=plan.id,
         start_date=start_date,
         end_date=end_date,

@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy import and_
 from datetime import datetime, timezone
 import jwt
@@ -10,7 +11,7 @@ from app.core.database import get_db
 from app.core.security import create_qr_token
 from app.api.dependencies import get_current_user_id
 from app.models.access import EntryLog
-from app.models.subscription import UserSubscription
+from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse
 from app.core.redis_client import redis_db
 
@@ -30,11 +31,12 @@ async def generate_qr(current_user_id: int = Depends(get_current_user_id)):
     return {"qr_token": qr_token, "expires_in_seconds": 60}
 
 
+# --- 2. DOOR SCANNER: Reads the QR code and verifies access ---
 @router.post("/scan", response_model=ScanResponse)
 async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
     """
     Simulates the physical scanner at the gym door.
-    Includes Redis anti-replay protection.
+    Includes location verification, time/day rules checking, and Redis anti-replay.
     """
 
     # 1. REDIS ANTI-REPLAY CHECK: Has this token been used already?
@@ -46,7 +48,7 @@ async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
             user_id=0
         )
 
-    # 2. Decode and verify the JWT token
+    # 2. DECODE JWT TOKEN: Verify signature and expiration
     try:
         payload = jwt.decode(scan_data.qr_token, SECRET_KEY, algorithms=[ALGORITHM])
 
@@ -60,11 +62,16 @@ async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
     except Exception:
         return ScanResponse(access_granted=False, message="Invalid QR Code", user_id=0)
 
-    # 3. Check if the user has an ACTIVE subscription right now
+    # 3. FETCH DB DATA: Get the user's active subscription, plan, allowed locations, and rules
     now = datetime.now(timezone.utc)
 
-    result = await db.execute(
-        select(UserSubscription).where(
+    stmt = (
+        select(UserSubscription)
+        .options(
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.locations),
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.rule)
+        )
+        .where(
             and_(
                 UserSubscription.user_id == user_id,
                 UserSubscription.is_active == 1,
@@ -72,10 +79,13 @@ async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
             )
         )
     )
+    result = await db.execute(stmt)
     active_sub = result.scalars().first()
 
-    entry_log = EntryLog(user_id=user_id)
+    # Pre-create the log entry with the location where the scan happened
+    entry_log = EntryLog(user_id=user_id, location_id=scan_data.location_id)
 
+    # 4. CHECK A: Does the user have an ACTIVE subscription right now?
     if not active_sub:
         entry_log.access_granted = False
         entry_log.reason = "No active subscription found or subscription expired"
@@ -83,15 +93,47 @@ async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
         await db.commit()
         return ScanResponse(access_granted=False, message=entry_log.reason, user_id=user_id)
 
-    # 4. Grant access
+    plan = active_sub.plan
+
+    # 5. CHECK B: Is the user allowed at THIS specific location?
+    allowed_location_ids = [loc.id for loc in plan.locations]
+    if scan_data.location_id not in allowed_location_ids:
+        entry_log.access_granted = False
+        entry_log.reason = "Subscription does not cover this gym location"
+        db.add(entry_log)
+        await db.commit()
+        return ScanResponse(access_granted=False, message=entry_log.reason, user_id=user_id)
+
+    # 6. CHECK C: Time and Day Rules (if any exist for this plan)
+    if plan.rule:
+        current_time = datetime.now().time()
+        current_day = str(datetime.now().weekday())  # 0=Monday, 6=Sunday
+
+        # Check allowed days
+        if plan.rule.allowed_days and current_day not in plan.rule.allowed_days.split(","):
+            entry_log.access_granted = False
+            entry_log.reason = "Access not allowed on this day of the week"
+            db.add(entry_log)
+            await db.commit()
+            return ScanResponse(access_granted=False, message=entry_log.reason, user_id=user_id)
+
+        # Check allowed hours
+        if plan.rule.allowed_time_start and plan.rule.allowed_time_end:
+            if not (plan.rule.allowed_time_start <= current_time <= plan.rule.allowed_time_end):
+                entry_log.access_granted = False
+                entry_log.reason = f"Access only allowed between {plan.rule.allowed_time_start} and {plan.rule.allowed_time_end}"
+                db.add(entry_log)
+                await db.commit()
+                return ScanResponse(access_granted=False, message=entry_log.reason, user_id=user_id)
+
+    # 7. GRANT ACCESS: All checks passed!
     entry_log.access_granted = True
     entry_log.reason = "Success"
     db.add(entry_log)
     await db.commit()
 
-    # 5. REDIS SAVE: Mark this token as "used" so nobody else can use it.
+    # 8. REDIS SAVE: Mark this token as "used" so nobody else can use it.
     # 'ex=60' means Redis will automatically delete this record after 60 seconds
-    # (because the token itself expires in 60s anyway, no need to keep it forever).
     await redis_db.set(scan_data.qr_token, "used", ex=60)
 
     return ScanResponse(

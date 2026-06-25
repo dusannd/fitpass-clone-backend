@@ -1,5 +1,4 @@
 from pydantic import BaseModel
-from datetime import datetime
 
 class QRTokenResponse(BaseModel):
     qr_token: str
@@ -7,6 +6,8 @@ class QRTokenResponse(BaseModel):
 
 class ScanRequest(BaseModel):
     qr_token: str
+    location_id: int
+
 
 class ScanResponse(BaseModel):
     access_granted: bool

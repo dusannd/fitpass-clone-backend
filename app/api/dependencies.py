@@ -22,7 +22,7 @@ def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(secu
     try:
         # Decode the token using our secret key
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
+        user_id = payload.get("sub")
 
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token structure")
@@ -35,27 +35,42 @@ def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(secu
         raise HTTPException(status_code=401, detail="Invalid token.")
 
 
-
-def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+class RequireRole:
     """
-    Checks if the current user is an Admin.
-    Extracts the token, decodes it, and checks the 'role' field.
+    A dynamic dependency class for Role-Based Access Control (RBAC).
+    Usage in endpoints: Depends(RequireRole("admin")) or Depends(RequireRole("worker"))
     """
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        role = payload.get("role")
 
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token structure")
+    def __init__(self, required_role: str):
+        self.required_role = required_role
 
-        if role != "admin":
-            raise HTTPException(status_code=403, detail="Forbidden: You don't have Admin privileges")
+    def __call__(self, credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+        token = credentials.credentials
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("sub")
 
-        return int(user_id)
+            # We now fetch the LIST of roles from the token
+            user_roles = payload.get("roles", [])
 
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
+            if user_id is None:
+                raise HTTPException(status_code=401, detail="Invalid token structure")
+
+            # Check if the user has the required role in their list of roles
+            if self.required_role not in user_roles:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
+                )
+
+            return int(user_id)
+
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expired.")
+        except jwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token.")
+
+
+# For backward compatibility with our current admin routes
+# This automatically creates a dependency that checks for the "admin" role
+get_current_admin = RequireRole("admin")

@@ -14,9 +14,14 @@ class EntryLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
+    # NOVO: Ako je radnik ručno pustio korisnika (bez QR koda), ovde piše ID tog radnika.
+    # Ako je korisnik ušao sam preko QR skenera, ovo ostaje NULL.
+    worker_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     access_granted = Column(Boolean, nullable=False)  # True if door opened, False if rejected
-    reason = Column(String, nullable=True)  # E.g., "Subscription expired", "Success"
+    reason = Column(String, nullable=True)  # E.g., "Subscription expired", "Success", "Manual Override"
 
-    # Relationship
-    user = relationship("User", backref="entry_logs")
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id], backref="entry_logs")
+    worker = relationship("User", foreign_keys=[worker_id])
