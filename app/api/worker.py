@@ -19,6 +19,7 @@ get_current_worker = RequireRole("worker")
 @router.post("/manual-entry/{target_user_id}")
 async def manual_entry_override(
         target_user_id: int,
+        location_id: int,
         db: AsyncSession = Depends(get_db),
         worker_id: int = Depends(get_current_worker)
 ):
@@ -32,9 +33,17 @@ async def manual_entry_override(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
 
+        # --- NEW: VALIDATE LOCATION ---
+    from app.models.subscription import GymLocation  # Add import if needed
+    loc_result = await db.execute(select(GymLocation).where(GymLocation.id == location_id))
+    if not loc_result.scalars().first():
+        raise HTTPException(status_code=404, detail="Gym location not found")
+
+    # Update EntryLog to include location_id
     entry_log = EntryLog(
         user_id=target_user.id,
         worker_id=worker_id,
+        location_id=location_id,  # <--- NEW: Store the location in the log
         access_granted=True,
         reason="Manual Override by Desk Worker"
     )

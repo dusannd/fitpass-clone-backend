@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, time
 from typing import Optional, List
 
@@ -44,9 +44,9 @@ class PlanCreate(BaseModel):
     price: float
     duration_days: int = 30
 
-    # NOVO: Admin šalje listu ID-jeva teretana u koje ovaj paket može da uđe
+
     location_ids: List[int] = []
-    # NOVO: Opciono pravilo (ako ga nema, paket važi 24/7)
+
     rule: Optional[RuleCreate] = None
 
 
@@ -78,3 +78,18 @@ class UserSubscriptionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --- 5. SUBCRIPTION RULES 2 ---
+
+class PlanCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+    # ge=0 means "Greater than or Equal to 0" (Price cannot be negative, but 0 is allowed for free trials)
+    price: float = Field(..., ge=0, description="Price must be 0 or greater")
+
+    # gt=0 means "Greater Than 0" (Duration must be at least 1 day)
+    duration_days: int = Field(default=30, gt=0, description="Duration must be at least 1 day")
+
+    location_ids: List[int] = []
+    rule: Optional[RuleCreate] = None

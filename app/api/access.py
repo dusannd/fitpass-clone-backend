@@ -11,9 +11,12 @@ from app.core.database import get_db
 from app.core.security import create_qr_token
 from app.api.dependencies import get_current_user_id
 from app.models.access import EntryLog
-from app.models.subscription import UserSubscription, SubscriptionPlan
+from app.models.subscription import UserSubscription, SubscriptionPlan, GymLocation
+from app.models.user import User
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse
 from app.core.redis_client import redis_db
+
+
 
 router = APIRouter()
 
@@ -61,6 +64,39 @@ async def scan_qr(scan_data: ScanRequest, db: AsyncSession = Depends(get_db)):
         return ScanResponse(access_granted=False, message="QR Code expired. Refresh your app.", user_id=0)
     except Exception:
         return ScanResponse(access_granted=False, message="Invalid QR Code", user_id=0)
+
+    loc_check = await db.execute(select(GymLocation).where(GymLocation.id == scan_data.location_id))
+    if not loc_check.scalars().first():
+        return ScanResponse(
+            access_granted=False,
+            message=f"System Error: Unrecognized scanner location ID ({scan_data.location_id}).",
+            user_id=user_id or 0)
+
+    # --- 🛡️ NEW: DATABASE VALIDATION BEFORE INSERT ---
+
+    # Check 1: Does the user still exist in the database?
+    # (Prevents 500 error if user was deleted after generating the QR code)
+    user_check = await db.execute(select(User).where(User.id == user_id))
+    if not user_check.scalars().first():
+        return ScanResponse(
+            access_granted=False,
+            message="System Error: User account no longer exists.",
+            user_id=user_id
+        )
+
+    # Check 2: Does the scanner location exist?
+    # (Prevents 500 error if scanner sends an invalid location_id)
+    loc_check = await db.execute(select(GymLocation).where(GymLocation.id == scan_data.location_id))
+    if not loc_check.scalars().first():
+        return ScanResponse(
+            access_granted=False,
+            message=f"System Error: Unrecognized scanner location ID ({scan_data.location_id}).",
+            user_id=user_id
+        )
+
+    # --- END OF NEW VALIDATION ---
+
+
 
     # 3. FETCH DB DATA: Get the user's active subscription, plan, allowed locations, and rules
     now = datetime.now(timezone.utc)

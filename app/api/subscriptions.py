@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import and_
 from datetime import datetime, timedelta, timezone
 from typing import List
 
@@ -75,6 +76,15 @@ async def create_plan(
         locations = loc_result.scalars().all()
         new_plan.locations.extend(locations)
 
+     # --- BUG 3 FIX: STRICT VALIDATION ---
+     # If the number of found locations doesn't match the requested number, some IDs are invalid.
+    if len(locations) != len(plan.location_ids):
+        raise HTTPException(
+             status_code=400,
+              detail="One or more location_ids provided do not exist."
+         )
+
+
     # 3. Create rules if provided (One-to-One)
     db.add(new_plan)
     await db.commit()  # Commit so new_plan gets an ID
@@ -123,8 +133,28 @@ async def subscribe_user(
         current_user_id: int = Depends(get_current_user_id)
 ):
     """
-    User buys a plan.
+       User buys a plan. Prevents buying if an active subscription already exists.
     """
+    # --- NEW: PREVENT DOUBLE SUBSCRIPTIONS ---
+    # Check if the user already has an active subscription
+    now = datetime.now(timezone.utc)
+    active_sub_check = await db.execute(
+        select(UserSubscription).where(
+            and_(
+                UserSubscription.user_id == current_user_id,
+                UserSubscription.is_active == 1,
+                UserSubscription.end_date > now
+            )
+        )
+    )
+    if active_sub_check.scalars().first():
+        raise HTTPException(
+            status_code=400,
+            detail="You already have an active subscription. Wait for it to expire."
+        )
+    # --- END NEW VALIDATION ---
+
+    # 1. Check if the requested plan exists
     result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == subscription.plan_id))
     plan = result.scalars().first()
 
