@@ -36,6 +36,9 @@ class SubscriptionPlan(Base):
     price = Column(Float, nullable=False)
     duration_days = Column(Integer, default=30)
 
+    # NEW: Used for Soft Deletion (hiding old plans from the frontend)
+    is_active = Column(Boolean, default=True)
+
     # Relationships
     user_subscriptions = relationship("UserSubscription", back_populates="plan")
 

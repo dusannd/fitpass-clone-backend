@@ -9,6 +9,11 @@ class GymLocationCreate(BaseModel):
     address: Optional[str] = None
     is_24_7: bool = True
 
+class GymLocationUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    is_24_7: Optional[bool] = None
+
 
 class GymLocationResponse(BaseModel):
     id: int
@@ -50,12 +55,21 @@ class PlanCreate(BaseModel):
     rule: Optional[RuleCreate] = None
 
 
+# --- UPDATE PLAN SCHEMA ---
+class PlanUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = Field(None, ge=0, description="Price must be 0 or greater")
+    duration_days: Optional[int] = Field(None, gt=0, description="Duration must be at least 1 day")
+
+
 class PlanResponse(BaseModel):
     id: int
     name: str
     description: Optional[str]
     price: float
     duration_days: int
+    is_active: bool
     locations: List[GymLocationResponse] = []
     rule: Optional[RuleResponse] = None
 
