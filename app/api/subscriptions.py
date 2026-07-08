@@ -262,6 +262,8 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     return result.scalars().all()
 
+"""
+
 # ==========================================
 # 3. USER SUBSCRIPTIONS (LOGGED IN USERS)
 # ==========================================
@@ -271,9 +273,9 @@ async def subscribe_user(
         db: AsyncSession = Depends(get_db),
         current_user_id: int = Depends(get_current_user_id)
 ):
-    """
-       User buys a plan. Prevents buying if an active subscription already exists.
-    """
+   
+      # User buys a plan. Prevents buying if an active subscription already exists.
+    
     # --- NEW: PREVENT DOUBLE SUBSCRIPTIONS ---
     # Check if the user already has an active subscription
     now = datetime.now(timezone.utc)
@@ -317,3 +319,4 @@ async def subscribe_user(
 
     return new_sub
 
+"""

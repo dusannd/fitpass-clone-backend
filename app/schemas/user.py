@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Any
 
+from app.schemas.subscription import UserSubscriptionResponse
 
 # --- SCHEMA FOR ROLES ---
 class RoleResponse(BaseModel):
@@ -28,6 +29,9 @@ class UserResponse(BaseModel):
 
     # We replaced 'role: str' with a list of roles!
     roles: List[RoleResponse] = []
+
+    # NEW: Admin frontend needs to see active subscriptions easily
+    subscriptions: List[UserSubscriptionResponse] = []
 
     class Config:
         from_attributes = True

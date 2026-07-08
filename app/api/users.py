@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 
 # We now import the Role model as well
 from app.models.user import User, Role
@@ -10,6 +11,9 @@ from app.core.security import get_password_hash, verify_password, create_access_
 from app.api.dependencies import RequireRole
 
 router = APIRouter()
+
+# BOUNCER
+get_current_admin = RequireRole("admin")
 
 
 @router.post("/", response_model=UserResponse)
@@ -55,11 +59,21 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/", response_model=list[UserResponse])
-async def get_all_users(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User))
+async def get_all_users(
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin) # <--- ZAKLJUČANO ZA ADMINA
+):
+    """
+    Admin Dashboard route: Fetch all users along with their roles and subscriptions.
+    """
+    # Fetch users, and join their roles AND their subscriptions in one fast query
+    stmt = select(User).options(
+        selectinload(User.roles),
+        selectinload(User.subscriptions) # Puni listu pretplata za front-end
+    )
+    result = await db.execute(stmt)
     users = result.scalars().all()
     return users
-
 
 @router.post("/login", response_model=Token)
 async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db)):

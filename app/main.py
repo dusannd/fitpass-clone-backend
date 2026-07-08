@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
 from app.core.redis_client import check_redis_connection
@@ -10,7 +11,7 @@ from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
 
 # --- 3. ROUTER IMPORTS ---
-from app.api import users, subscriptions, access, admin, worker
+from app.api import users, subscriptions, access, admin, worker, payments
 
 app = FastAPI(
     title="FitPass Clone / Gym API",
@@ -35,6 +36,7 @@ app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(subscriptions.router, prefix="/api/subscriptions", tags=["Subscriptions"])
 app.include_router(access.router, prefix="/api/access", tags=["Door Access"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin Dashboard"])
+app.include_router(payments.router, prefix="/api/payments", tags=["Stripe Payments"])
 app.include_router(worker.router, prefix="/api/worker", tags=["Desk Worker"])
 
 
