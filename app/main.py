@@ -16,7 +16,7 @@ from app.api import users, subscriptions, access, admin, worker, payments
 app = FastAPI(
     title="FitPass Clone / Gym API",
     description="Backend API for gym management and QR access",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 # --- STARTUP EVENTS ---
