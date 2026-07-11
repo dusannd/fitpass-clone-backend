@@ -43,6 +43,12 @@ class User(Base):
 
     # RELATIONSHIPS
     subscriptions = relationship("UserSubscription", backref="user")
-
-    # NEW RELATIONSHIP: Connects User to Role via the user_roles table
+    # Connects User to Role via the user_roles table
     roles = relationship("Role", secondary=user_roles, lazy="selectin")
+
+    # NEW: Connects User (Trainer) to the workout plans they create
+    created_plans = relationship("WorkoutPlan", back_populates="trainer", cascade="all, delete-orphan")
+
+    # NEW: Connects a standard User (Member) to the workout plans they are following
+    saved_plans = relationship("WorkoutPlan", secondary="user_saved_plans", back_populates="saved_by_users",
+                               lazy="selectin")

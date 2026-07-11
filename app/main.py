@@ -9,9 +9,11 @@ from app.services.scheduler import start_scheduler
 # --- 2. MODEL IMPORTS (Needed for SQLAlchemy to create tables) ---
 from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
+from app.models.workout import WorkoutPlan, Exercise
+
 
 # --- 3. ROUTER IMPORTS ---
-from app.api import users, subscriptions, access, admin, worker, payments
+from app.api import users, subscriptions, access, admin, worker, payments, trainer, workouts
 
 app = FastAPI(
     title="FitPass Clone / Gym API",
@@ -38,6 +40,9 @@ app.include_router(access.router, prefix="/api/access", tags=["Door Access"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin Dashboard"])
 app.include_router(payments.router, prefix="/api/payments", tags=["Stripe Payments"])
 app.include_router(worker.router, prefix="/api/worker", tags=["Desk Worker"])
+app.include_router(trainer.router, prefix="/api/trainer", tags=["Trainer Dashboard"])
+app.include_router(workouts.router, prefix="/api/workouts", tags=["Workouts (Members)"])
+
 
 
 # --- HEALTH CHECK (Placed at the bottom) ---

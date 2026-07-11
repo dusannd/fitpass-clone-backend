@@ -11,8 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.database import SQLALCHEMY_DATABASE_URL, Base
 
 # 3. CRITICAL: Import ALL models here!
-# If not imported, Base.metadata will be empty and Alembic won't detect tables.
-from app.models import user, subscription, access
+from app.models import user, subscription, access, workout
 
 
 from sqlalchemy import pool
