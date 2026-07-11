@@ -46,3 +46,11 @@ class UserLogin(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+# --- HR PANEL SCHEMAS ---
+class RoleManageRequest(BaseModel):
+    """
+    Schema for assigning or revoking roles via the Admin HR panel.
+    """
+    email: EmailStr
+    role_name: str

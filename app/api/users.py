@@ -55,7 +55,18 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(new_user)
 
-    return new_user
+    # FIX for async sqlalchemy (MissingGreenlet Error):
+    # We must explicitly reload the user with all necessary relationships (roles, subscriptions)
+    # before returning it to Pydantic for serialization.
+    stmt = (
+        select(User)
+        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .where(User.id == new_user.id)
+    )
+    result = await db.execute(stmt)
+    created_user = result.scalars().first()
+
+    return created_user
 
 
 @router.get("/", response_model=list[UserResponse])
@@ -98,54 +109,6 @@ async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db))
     # 5. Return the token to the client
     return {"access_token": access_token, "token_type": "bearer"}
 
-"""
-# --- TEMPORARY BACKDOOR FOR DEVELOPMENT ---
-from sqlalchemy.orm import selectinload
-
-@router.post("/setup-superuser/{user_id}")
-async def setup_superuser(user_id: int, db: AsyncSession = Depends(get_db)):
-  
-    TEMPORARY ENDPOINT: Gives a user 'admin' and 'worker' privileges.
-    Used only for initial setup.
-
-    # 1. Fetch the user and eagerly load their current roles
-    result = await db.execute(select(User).options(selectinload(User.roles)).where(User.id == user_id))
-    user = result.scalars().first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # 2. Define the roles we want to grant
-    super_roles = ["admin", "worker"]
-
-    for role_name in super_roles:
-        # Check if role exists in DB, create if not
-        role_result = await db.execute(select(Role).where(Role.name == role_name))
-        role_obj = role_result.scalars().first()
-
-        if not role_obj:
-            role_obj = Role(name=role_name, description=f"{role_name.capitalize()} privileges")
-            db.add(role_obj)
-            await db.commit()
-            await db.refresh(role_obj)
-
-        # Assign role to user if they don't already have it
-        if not any(r.name == role_name for r in user.roles):
-            user.roles.append(role_obj)
-
-    # 3. Save the updated user to DB
-    db.add(user)
-    await db.commit()
-
-    # Extract all role names to show in the response
-    current_roles = [r.name for r in user.roles]
-
-    return {
-        "message": f"Success! User {user.email} is now a superuser.",
-        "current_roles": current_roles
-    }
-
-"""
 
 get_current_admin = RequireRole("admin")
 
