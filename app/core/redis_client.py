@@ -19,3 +19,11 @@ async def check_redis_connection():
         print("Connected to Redis successfully!")
     except Exception as e:
         print(f"Failed to connect to Redis: {e}")
+
+
+async def close_redis_connection():
+    """
+    Safely closes the connection to Redis when shutting down the server
+    """
+    await redis_db.close()
+    print("Redis connection closed.")

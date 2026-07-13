@@ -1,18 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
 import jwt
-import os
-from dotenv import load_dotenv
-from pathlib import Path
 
-# Find the absolute path to the .env file in the root directory
-env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
 
-# Environment variables configuration
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -31,12 +22,12 @@ def create_access_token(data: dict) -> str:
     """
     to_encode = data.copy()
 
-    # Calculate expiration time (Current time + X minutes)
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Calculate expiration time using Pydantic settings
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
 
-    # Generate the encoded JWT string using our secret key
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    # Generate the encoded JWT string using our secret key and algorithm from settings
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
 
@@ -48,5 +39,5 @@ def create_qr_token(user_id: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=1)
     to_encode = {"sub": str(user_id), "type": "qr_access", "exp": expire}
 
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
