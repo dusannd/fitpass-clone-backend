@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.database import SQLALCHEMY_DATABASE_URL, Base
 
 # 3. CRITICAL: Import ALL models here!
-from app.models import user, subscription, access, workout
+from app.models import user, subscription, access, workout, coaching
 
 
 from sqlalchemy import pool

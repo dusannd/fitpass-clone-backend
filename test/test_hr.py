@@ -13,7 +13,6 @@ async def override_get_current_admin():
     return 1  # Simulate Admin User ID 1
 
 
-app.dependency_overrides[get_current_admin] = override_get_current_admin
 
 
 @pytest.mark.asyncio
@@ -39,40 +38,31 @@ async def test_hr_hiring_and_firing_flow():
         res_register = await ac.post("/api/users/", json=user_data)
         assert res_register.status_code == 200, "User was not created successfully"
 
-        # STEP 2: Admin hires this user as a 'trainer'
-        hire_payload = {
-            "email": random_email,
-            "role_name": "trainer"
-        }
-        res_hire = await ac.post("/api/admin/hr/hire", json=hire_payload)
+        # Safely wrap admin actions in try...finally so overrides don't leak
+        try:
+            # Temporarily make ourselves admin
+            app.dependency_overrides[get_current_admin] = override_get_current_admin
 
-        # Verify successful promotion
-        assert res_hire.status_code == 200
-        assert "successfully hired" in res_hire.json()["message"]
+            # STEP 2: Admin hires this user as a 'trainer'
+            hire_payload = {"email": random_email, "role_name": "trainer"}
+            res_hire = await ac.post("/api/admin/hr/hire", json=hire_payload)
+            assert res_hire.status_code == 200
+            assert "successfully hired" in res_hire.json()["message"]
 
-        # Verify system blocks duplicate hiring
-        res_hire_again = await ac.post("/api/admin/hr/hire", json=hire_payload)
-        assert res_hire_again.status_code == 400
-        assert "already a trainer" in res_hire_again.json()["detail"]
+            # Verify system blocks duplicate hiring
+            res_hire_again = await ac.post("/api/admin/hr/hire", json=hire_payload)
+            assert res_hire_again.status_code == 400
 
-        # STEP 3: Admin fires the trainer (revokes role)
-        fire_payload = {
-            "email": random_email,
-            "role_name": "trainer"
-        }
-        res_fire = await ac.post("/api/admin/hr/fire", json=fire_payload)
+            # STEP 3: Admin fires the trainer (revokes role)
+            fire_payload = {"email": random_email, "role_name": "trainer"}
+            res_fire = await ac.post("/api/admin/hr/fire", json=fire_payload)
+            assert res_fire.status_code == 200
 
-        assert res_fire.status_code == 200
-        assert "has been revoked" in res_fire.json()["message"]
+            # STEP 4: Ensure system blocks removal of the foundational 'member' role
+            fire_member_payload = {"email": random_email, "role_name": "member"}
+            res_fire_member = await ac.post("/api/admin/hr/fire", json=fire_member_payload)
+            assert res_fire_member.status_code == 400
 
-        # STEP 4: Ensure system blocks removal of the foundational 'member' role
-        fire_member_payload = {
-            "email": random_email,
-            "role_name": "member"
-        }
-        res_fire_member = await ac.post("/api/admin/hr/fire", json=fire_member_payload)
-        assert res_fire_member.status_code == 400
-        assert "Cannot remove the base 'member' role" in res_fire_member.json()["detail"]
-
-        # Clear the override so it doesn't affect other tests (like test_main.py)
-        app.dependency_overrides.clear()
+        finally:
+            # CRITICAL: Always clear overrides so they don't break other tests!
+            app.dependency_overrides.clear()

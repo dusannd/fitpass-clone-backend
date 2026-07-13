@@ -23,16 +23,22 @@ class WorkoutPlan(Base):
     # Foreign key linking to the User (Trainer) who created this plan
     trainer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
 
+    # NEW: If NULL, the plan is public. If an ID is present, it's a private plan assigned to a specific client.
+    client_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+
     name = Column(String, index=True, nullable=False)
     description = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
-    # A plan can have multiple exercises. If the plan is deleted, its exercises are deleted too.
+    # A plan can have multiple exercises.
     exercises = relationship("Exercise", back_populates="plan", cascade="all, delete-orphan")
 
-    # Link back to the user who created it
-    trainer = relationship("User", back_populates="created_plans")
+    # FIX: Explicitly tell SQLAlchemy to use 'trainer_id' using string references
+    trainer = relationship("User", foreign_keys="WorkoutPlan.trainer_id", back_populates="created_plans")
+
+    # NEW: Relationship for the client assigned to this private plan
+    client = relationship("User", foreign_keys="WorkoutPlan.client_id")
 
     # List of regular users (members) who saved/followed this plan
     saved_by_users = relationship("User", secondary=user_saved_plans, back_populates="saved_plans")

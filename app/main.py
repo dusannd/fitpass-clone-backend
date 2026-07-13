@@ -11,10 +11,12 @@ from app.services.scheduler import start_scheduler
 from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
 from app.models.workout import WorkoutPlan, Exercise
+from app.models.coaching import TrainerClientLink, Appointment
+
 
 
 # --- 3. ROUTER IMPORTS ---
-from app.api import users, subscriptions, access, admin, worker, payments, trainer, workouts
+from app.api import users, subscriptions, access, admin, worker, payments, trainer, workouts, coaching
 
 
 
@@ -47,6 +49,7 @@ app.include_router(payments.router, prefix="/api/payments", tags=["Stripe Paymen
 app.include_router(worker.router, prefix="/api/worker", tags=["Desk Worker"])
 app.include_router(trainer.router, prefix="/api/trainer", tags=["Trainer Dashboard"])
 app.include_router(workouts.router, prefix="/api/workouts", tags=["Workouts (Members)"])
+app.include_router(coaching.router, prefix="/api/coaching", tags=["Coaching (1-on-1)"])
 
 
 
