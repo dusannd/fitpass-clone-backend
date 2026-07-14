@@ -42,3 +42,40 @@ class TrainerClientLinkResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# --- APPOINTMENT SCHEMAS ---
+
+class AppointmentCreate(BaseModel):
+    """
+    Schema for a client to request a new training session.
+    """
+    trainer_id: int
+    start_time: datetime
+    end_time: datetime
+
+class AppointmentUpdate(BaseModel):
+    """
+    Schema for a trainer to update the status of an appointment.
+    """
+    status: str  # Expected: 'COMPLETED' or 'CANCELLED'
+    notes: Optional[str] = None
+
+class AppointmentResponse(BaseModel):
+    """
+    Schema for returning appointment details.
+    """
+    id: int
+    trainer_id: int
+    client_id: int
+    start_time: datetime
+    end_time: datetime
+    status: str
+    notes: Optional[str]
+
+    # Include lightweight info so the frontend knows who the appointment is with
+    trainer: Optional[CoachingUser] = None
+    client: Optional[CoachingUser] = None
+
+    class Config:
+        from_attributes = True

@@ -51,7 +51,10 @@ async def get_trainer_plans(
     stmt = (
         select(WorkoutPlan)
         .options(selectinload(WorkoutPlan.exercises))
-        .where(WorkoutPlan.trainer_id == trainer_id)
+        .where(
+            WorkoutPlan.trainer_id == trainer_id,
+            WorkoutPlan.client_id.is_(None)
+        )
     )
     result = await db.execute(stmt)
     return result.scalars().all()
@@ -110,3 +113,21 @@ async def get_my_saved_plans(
     user = result.scalars().first()
 
     return user.saved_plans
+
+
+@router.get("/my-private-plans", response_model=List[WorkoutPlanResponse])
+async def get_my_private_plans(
+    db: AsyncSession = Depends(get_db),
+    member_id: int = Depends(get_current_member)
+):
+    """
+    Member App: Retrieve customized private plans created specifically for this user by their trainer.
+    """
+    stmt = (
+        select(WorkoutPlan)
+        .options(selectinload(WorkoutPlan.exercises))
+        .where(WorkoutPlan.client_id == member_id)
+        .order_by(WorkoutPlan.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
