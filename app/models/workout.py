@@ -1,8 +1,7 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, Float
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
-
 
 # Association table for members following a workout plan
 user_saved_plans = Table(
@@ -12,6 +11,7 @@ user_saved_plans = Table(
     Column("plan_id", Integer, ForeignKey("workout_plans.id", ondelete="CASCADE"), primary_key=True),
 )
 
+
 class WorkoutPlan(Base):
     """
     Represents a workout program created by a user with the 'trainer' role.
@@ -20,10 +20,7 @@ class WorkoutPlan(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # Foreign key linking to the User (Trainer) who created this plan
     trainer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    # NEW: If NULL, the plan is public. If an ID is present, it's a private plan assigned to a specific client.
     client_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
     name = Column(String, index=True, nullable=False)
@@ -31,16 +28,9 @@ class WorkoutPlan(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
-    # A plan can have multiple exercises.
     exercises = relationship("Exercise", back_populates="plan", cascade="all, delete-orphan")
-
-    # FIX: Explicitly tell SQLAlchemy to use 'trainer_id' using string references
     trainer = relationship("User", foreign_keys="WorkoutPlan.trainer_id", back_populates="created_plans")
-
-    # NEW: Relationship for the client assigned to this private plan
     client = relationship("User", foreign_keys="WorkoutPlan.client_id")
-
-    # List of regular users (members) who saved/followed this plan
     saved_by_users = relationship("User", secondary=user_saved_plans, back_populates="saved_plans")
 
 
@@ -51,16 +41,50 @@ class Exercise(Base):
     __tablename__ = "exercises"
 
     id = Column(Integer, primary_key=True, index=True)
-
-    # Foreign key linking to the WorkoutPlan
     plan_id = Column(Integer, ForeignKey("workout_plans.id", ondelete="CASCADE"), nullable=False)
 
     name = Column(String, nullable=False)
     sets = Column(Integer, default=3)
-
-    # Stored as string because reps can be "8-12", "15", or "Till failure"
     reps = Column(String, nullable=False)
     rest_time_seconds = Column(Integer, default=60, nullable=True)
 
     # Relationship back to the parent plan
     plan = relationship("WorkoutPlan", back_populates="exercises")
+
+
+class WorkoutSession(Base):
+    """
+    Represents a single instance of a user going to the gym and performing a workout plan.
+    """
+    __tablename__ = "workout_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    plan_id = Column(Integer, ForeignKey("workout_plans.id", ondelete="SET NULL"), nullable=True)
+
+    date = Column(DateTime(timezone=True), server_default=func.now())
+    notes = Column(String, nullable=True)
+
+    # Relationships
+    user = relationship("User", back_populates="workout_sessions")
+    plan = relationship("WorkoutPlan")
+    exercise_logs = relationship("ExerciseLog", back_populates="session", cascade="all, delete-orphan")
+
+
+class ExerciseLog(Base):
+    """
+    Represents the actual performance (weight, sets, reps) of a specific exercise.
+    """
+    __tablename__ = "exercise_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("workout_sessions.id", ondelete="CASCADE"), nullable=False)
+    exercise_id = Column(Integer, ForeignKey("exercises.id", ondelete="SET NULL"), nullable=True)
+
+    sets_completed = Column(Integer, nullable=False)
+    reps_completed = Column(String, nullable=False)
+    weight_kg = Column(Float, nullable=True)
+
+    # Relationships
+    session = relationship("WorkoutSession", back_populates="exercise_logs")
+    exercise = relationship("Exercise")

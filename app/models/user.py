@@ -45,7 +45,7 @@ class User(Base):
     subscriptions = relationship("UserSubscription", backref="user")
     # Connects User to Role via the user_roles table
     roles = relationship("Role", secondary=user_roles, lazy="selectin")
-    # NEW: Coaching relationships (Trainer-Client links)
+    # Coaching relationships (Trainer-Client links)
     clients_linked = relationship("TrainerClientLink", foreign_keys="TrainerClientLink.trainer_id",
                                   back_populates="trainer", cascade="all, delete-orphan")
     trainers_linked = relationship("TrainerClientLink", foreign_keys="TrainerClientLink.client_id",
@@ -55,6 +55,8 @@ class User(Base):
     # FIX: Added foreign_keys to resolve ambiguity with private client plans
     created_plans = relationship("WorkoutPlan", foreign_keys="WorkoutPlan.trainer_id", back_populates="trainer",
                                  cascade="all, delete-orphan")
-    # NEW: Connects a standard User (Member) to the workout plans they are following
+    # Connects a standard User (Member) to the workout plans they are following
     saved_plans = relationship("WorkoutPlan", secondary="user_saved_plans", back_populates="saved_by_users",
                                lazy="selectin")
+    # NEW: Historical logs of completed workout sessions by the user
+    workout_sessions = relationship("WorkoutSession", back_populates="user", cascade="all, delete-orphan")

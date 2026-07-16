@@ -7,9 +7,9 @@ from typing import List
 from app.core.database import get_db
 from app.api.dependencies import RequireRole
 from app.models.user import User, Role
-from app.models.workout import WorkoutPlan
 from app.schemas.user import UserResponse
-from app.schemas.workout import WorkoutPlanResponse
+from app.models.workout import WorkoutPlan, WorkoutSession, ExerciseLog
+from app.schemas.workout import WorkoutPlanResponse, WorkoutSessionCreate, WorkoutSessionResponse
 
 router = APIRouter()
 
@@ -128,6 +128,77 @@ async def get_my_private_plans(
         .options(selectinload(WorkoutPlan.exercises))
         .where(WorkoutPlan.client_id == member_id)
         .order_by(WorkoutPlan.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+# ==========================================
+# WORKOUT LOGGING (PROGRESS TRACKING)
+# ==========================================
+
+@router.post("/log-session", response_model=WorkoutSessionResponse)
+async def log_workout_session(
+        payload: WorkoutSessionCreate,
+        db: AsyncSession = Depends(get_db),
+        member_id: int = Depends(get_current_member)
+):
+    """
+    Member App: Log a completed workout session with actual performance stats (weight, sets, reps).
+    """
+    # 1. Create the parent session
+    new_session = WorkoutSession(
+        user_id=member_id,
+        plan_id=payload.plan_id,
+        notes=payload.notes
+    )
+    db.add(new_session)
+    await db.flush()  # Flush to get the new_session.id
+
+    # 2. Add all exercise performance logs to this session
+    for log in payload.exercises:
+        new_log = ExerciseLog(
+            session_id=new_session.id,
+            exercise_id=log.exercise_id,
+            sets_completed=log.sets_completed,
+            reps_completed=log.reps_completed,
+            weight_kg=log.weight_kg
+        )
+        db.add(new_log)
+
+    await db.commit()
+
+    # 3. Reload from DB to attach nested relationships for the response
+    stmt = (
+        select(WorkoutSession)
+        .options(
+            selectinload(WorkoutSession.exercise_logs)
+            .selectinload(ExerciseLog.exercise)
+        )
+        .where(WorkoutSession.id == new_session.id)
+    )
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+@router.get("/history", response_model=List[WorkoutSessionResponse])
+async def get_workout_history(
+        limit: int = 20,
+        db: AsyncSession = Depends(get_db),
+        member_id: int = Depends(get_current_member)
+):
+    """
+    Member App: Fetch the user's workout history (useful for plotting progress charts).
+    """
+    stmt = (
+        select(WorkoutSession)
+        .options(
+            selectinload(WorkoutSession.exercise_logs)
+            .selectinload(ExerciseLog.exercise)
+        )
+        .where(WorkoutSession.user_id == member_id)
+        .order_by(WorkoutSession.date.desc())
+        .limit(limit)
     )
     result = await db.execute(stmt)
     return result.scalars().all()
