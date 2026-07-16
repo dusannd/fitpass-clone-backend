@@ -2,6 +2,12 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.core.database import Base, get_db
 from app.main import app
+from app.core.config import settings
+
+
+# 1. MAGIC FLAG: Tell the application we are currently running tests!
+settings.TESTING = True
+
 
 # Create a separate database JUST for testing (SQLite in-memory is the fastest)
 # It creates a fresh empty database every time you run pytest

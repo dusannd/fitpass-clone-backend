@@ -22,8 +22,8 @@ async def test_workout_logging_flow():
     """
     transport = ASGITransport(app=app)
 
-    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@gym.com"
-    member_email = f"member_{uuid.uuid4().hex[:6]}@gym.com"
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    member_email = f"member_{uuid.uuid4().hex[:6]}@test.com"
     password = "password123"
 
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

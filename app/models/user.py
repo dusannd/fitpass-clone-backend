@@ -35,6 +35,7 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
 
     # We REMOVED the old 'role' string column here!
 

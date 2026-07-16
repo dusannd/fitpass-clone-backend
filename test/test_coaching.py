@@ -24,8 +24,8 @@ async def test_coaching_request_flow():
     transport = ASGITransport(app=app)
 
     # Generate unique emails for this test run
-    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@gym.com"
-    member_email = f"member_{uuid.uuid4().hex[:6]}@gym.com"
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    member_email = f"member_{uuid.uuid4().hex[:6]}@test.com"
     password = "testpassword123"
 
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

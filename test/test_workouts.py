@@ -20,9 +20,9 @@ async def test_private_workout_plans_security_and_visibility():
     transport = ASGITransport(app=app)
 
     # Generate unique emails
-    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@gym.com"
-    client_a_email = f"client_a_{uuid.uuid4().hex[:6]}@gym.com"
-    client_b_email = f"client_b_{uuid.uuid4().hex[:6]}@gym.com"
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    client_a_email = f"client_a_{uuid.uuid4().hex[:6]}@test.com"
+    client_b_email = f"client_b_{uuid.uuid4().hex[:6]}@test.com"
     password = "testpassword123"
 
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

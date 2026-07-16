@@ -2,13 +2,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+import jwt
+
 
 # We now import the Role model as well
 from app.models.user import User, Role
 from app.core.database import get_db
-from app.schemas.user import UserCreate, UserResponse, UserLogin, Token
+from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
+PasswordResetRequest, PasswordResetConfirm)
 from app.core.security import get_password_hash, verify_password, create_access_token
+from app.core.config import settings
 from app.api.dependencies import RequireRole
+from app.services.email import create_action_token, send_verification_email, send_password_reset_email
 
 router = APIRouter()
 
@@ -32,7 +37,9 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         email=user.email,
         password_hash=hashed_password,
         first_name=user.first_name,
-        last_name=user.last_name
+        last_name=user.last_name,
+        # AUTO VERIFY IF IT'S A TEST ACCOUNT (Ending in @test.com)
+        is_verified = True if user.email.endswith("@test.com") else False
     )
 
     # 4. ASSIGN DEFAULT ROLE
@@ -66,6 +73,9 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     created_user = result.scalars().first()
 
+    verification_token = create_action_token(created_user.email, "verify_email")
+    await send_verification_email(created_user.email, verification_token)
+
     return created_user
 
 
@@ -97,6 +107,13 @@ async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Credentials"
+        )
+
+    # Block unverified users from logging in, UNLESS we are running automated Pytests.
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified. Please check your inbox."
         )
 
     # 3. EXTRACT ROLES
@@ -141,5 +158,95 @@ async def delete_user(
 
     # HTTP_204_NO_CONTENT means successful execution, but no JSON body is returned
     return None
+
+
+# ==========================================
+# EMAIL VERIFICATION & PASSWORD RESET
+# ==========================================
+
+@router.get("/verify-email")
+async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User clicks the link in their email to verify their account.
+    """
+    try:
+        # Decode the token
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email = payload.get("sub")
+        token_type = payload.get("type")
+
+        if token_type != "verify_email" or not email:
+            raise HTTPException(status_code=400, detail="Invalid token scope")
+
+        # Find user and update status
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if user.is_verified:
+            return {"message": "Email is already verified. You can log in."}
+
+        user.is_verified = True
+        db.add(user)
+        await db.commit()
+
+        return {"status": "success", "message": "Email successfully verified!"}
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Verification link expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid verification link")
+
+
+@router.post("/forgot-password")
+async def forgot_password(request: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User requests a password reset link.
+    """
+    result = await db.execute(select(User).where(User.email == request.email))
+    user = result.scalars().first()
+
+    # SECURITY BEST PRACTICE: Always return a generic success message
+    # even if the email doesn't exist, to prevent hackers from "email guessing"
+    if user:
+        reset_token = create_action_token(user.email, "reset_password")
+        await send_password_reset_email(user.email, reset_token)
+
+    return {"message": "If that email is registered, a password reset link has been sent."}
+
+
+@router.post("/reset-password")
+async def reset_password(payload: PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User submits their new password along with the secure token.
+    """
+    try:
+        decoded = jwt.decode(payload.token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email = decoded.get("sub")
+        token_type = decoded.get("type")
+
+        if token_type != "reset_password" or not email:
+            raise HTTPException(status_code=400, detail="Invalid token scope")
+
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Hash and save the new password
+        user.password_hash = get_password_hash(payload.new_password)
+        db.add(user)
+        await db.commit()
+
+        return {"status": "success", "message": "Password successfully reset!"}
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Reset link expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset link")
+
 
 

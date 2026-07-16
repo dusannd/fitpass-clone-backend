@@ -22,8 +22,8 @@ async def test_appointment_scheduling_flow():
     """
     transport = ASGITransport(app=app)
 
-    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@gym.com"
-    client_email = f"client_{uuid.uuid4().hex[:6]}@gym.com"
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    client_email = f"client_{uuid.uuid4().hex[:6]}@test.com"
     password = "password123"
 
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

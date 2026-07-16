@@ -26,11 +26,12 @@ class UserResponse(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
     is_active: bool
-
+    is_verified: bool
+    
     # We replaced 'role: str' with a list of roles!
     roles: List[RoleResponse] = []
 
-    # NEW: Admin frontend needs to see active subscriptions easily
+    # Admin frontend needs to see active subscriptions easily
     subscriptions: List[UserSubscriptionResponse] = []
 
     class Config:
@@ -54,3 +55,12 @@ class RoleManageRequest(BaseModel):
     """
     email: EmailStr
     role_name: str
+
+
+# --- PASSWORD RESET SCHEMAS ---
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
