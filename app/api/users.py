@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 import jwt
 
-
+from app.core.rate_limit import limiter
 # We now import the Role model as well
 from app.models.user import User, Role
 from app.core.database import get_db
@@ -38,8 +39,8 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         password_hash=hashed_password,
         first_name=user.first_name,
         last_name=user.last_name,
-        # AUTO VERIFY IF IT'S A TEST ACCOUNT (Ending in @test.com)
-        is_verified = True if user.email.endswith("@test.com") else False
+        # SECURE FIX: Auto-verify only if we are actively running Pytest!
+        is_verified=True if (user.email.endswith("@test.com") and getattr(settings, "TESTING", False)) else False
     )
 
     # 4. ASSIGN DEFAULT ROLE
@@ -97,7 +98,13 @@ async def get_all_users(
     return users
 
 @router.post("/login", response_model=Token)
-async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def login(
+    request: Request,
+    user_credentials: UserLogin,
+    db: AsyncSession = Depends(get_db)
+):
+
     # 1. Fetch user from the database by email
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalars().first()

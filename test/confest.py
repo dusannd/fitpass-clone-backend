@@ -3,6 +3,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.core.database import Base, get_db
 from app.main import app
 from app.core.config import settings
+from app.core.rate_limit import limiter
+limiter.enabled = False
 
 
 # 1. MAGIC FLAG: Tell the application we are currently running tests!

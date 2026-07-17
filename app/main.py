@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from app.core.rate_limit import limiter
 
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
@@ -12,8 +15,6 @@ from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
 from app.models.workout import WorkoutPlan, Exercise
 from app.models.coaching import TrainerClientLink, Appointment
-
-
 
 # --- 3. ROUTER IMPORTS ---
 from app.api import users, subscriptions, access, admin, worker, payments, trainer, workouts, coaching
@@ -39,6 +40,9 @@ app = FastAPI(
     version="4.0.0-dev",
     lifespan=lifespan
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- ROUTER REGISTRATION (This order determines the layout in Swagger UI) ---
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
