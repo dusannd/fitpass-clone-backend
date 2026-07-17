@@ -1,14 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+import jwt
 
+from app.core.rate_limit import limiter
 # We now import the Role model as well
 from app.models.user import User, Role
 from app.core.database import get_db
-from app.schemas.user import UserCreate, UserResponse, UserLogin, Token
+from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
+PasswordResetRequest, PasswordResetConfirm)
 from app.core.security import get_password_hash, verify_password, create_access_token
+from app.core.config import settings
 from app.api.dependencies import RequireRole
+from app.services.email import create_action_token, send_verification_email, send_password_reset_email
 
 router = APIRouter()
 
@@ -32,7 +38,9 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         email=user.email,
         password_hash=hashed_password,
         first_name=user.first_name,
-        last_name=user.last_name
+        last_name=user.last_name,
+        # SECURE FIX: Auto-verify only if we are actively running Pytest!
+        is_verified=True if (user.email.endswith("@test.com") and getattr(settings, "TESTING", False)) else False
     )
 
     # 4. ASSIGN DEFAULT ROLE
@@ -55,7 +63,21 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(new_user)
 
-    return new_user
+    # FIX for async sqlalchemy (MissingGreenlet Error):
+    # We must explicitly reload the user with all necessary relationships (roles, subscriptions)
+    # before returning it to Pydantic for serialization.
+    stmt = (
+        select(User)
+        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .where(User.id == new_user.id)
+    )
+    result = await db.execute(stmt)
+    created_user = result.scalars().first()
+
+    verification_token = create_action_token(created_user.email, "verify_email")
+    await send_verification_email(created_user.email, verification_token)
+
+    return created_user
 
 
 @router.get("/", response_model=list[UserResponse])
@@ -76,7 +98,13 @@ async def get_all_users(
     return users
 
 @router.post("/login", response_model=Token)
-async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def login(
+    request: Request,
+    user_credentials: UserLogin,
+    db: AsyncSession = Depends(get_db)
+):
+
     # 1. Fetch user from the database by email
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalars().first()
@@ -86,6 +114,13 @@ async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Credentials"
+        )
+
+    # Block unverified users from logging in, UNLESS we are running automated Pytests.
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified. Please check your inbox."
         )
 
     # 3. EXTRACT ROLES
@@ -98,54 +133,6 @@ async def login(user_credentials: UserLogin, db: AsyncSession = Depends(get_db))
     # 5. Return the token to the client
     return {"access_token": access_token, "token_type": "bearer"}
 
-"""
-# --- TEMPORARY BACKDOOR FOR DEVELOPMENT ---
-from sqlalchemy.orm import selectinload
-
-@router.post("/setup-superuser/{user_id}")
-async def setup_superuser(user_id: int, db: AsyncSession = Depends(get_db)):
-  
-    TEMPORARY ENDPOINT: Gives a user 'admin' and 'worker' privileges.
-    Used only for initial setup.
-
-    # 1. Fetch the user and eagerly load their current roles
-    result = await db.execute(select(User).options(selectinload(User.roles)).where(User.id == user_id))
-    user = result.scalars().first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # 2. Define the roles we want to grant
-    super_roles = ["admin", "worker"]
-
-    for role_name in super_roles:
-        # Check if role exists in DB, create if not
-        role_result = await db.execute(select(Role).where(Role.name == role_name))
-        role_obj = role_result.scalars().first()
-
-        if not role_obj:
-            role_obj = Role(name=role_name, description=f"{role_name.capitalize()} privileges")
-            db.add(role_obj)
-            await db.commit()
-            await db.refresh(role_obj)
-
-        # Assign role to user if they don't already have it
-        if not any(r.name == role_name for r in user.roles):
-            user.roles.append(role_obj)
-
-    # 3. Save the updated user to DB
-    db.add(user)
-    await db.commit()
-
-    # Extract all role names to show in the response
-    current_roles = [r.name for r in user.roles]
-
-    return {
-        "message": f"Success! User {user.email} is now a superuser.",
-        "current_roles": current_roles
-    }
-
-"""
 
 get_current_admin = RequireRole("admin")
 
@@ -178,5 +165,95 @@ async def delete_user(
 
     # HTTP_204_NO_CONTENT means successful execution, but no JSON body is returned
     return None
+
+
+# ==========================================
+# EMAIL VERIFICATION & PASSWORD RESET
+# ==========================================
+
+@router.get("/verify-email")
+async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User clicks the link in their email to verify their account.
+    """
+    try:
+        # Decode the token
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email = payload.get("sub")
+        token_type = payload.get("type")
+
+        if token_type != "verify_email" or not email:
+            raise HTTPException(status_code=400, detail="Invalid token scope")
+
+        # Find user and update status
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if user.is_verified:
+            return {"message": "Email is already verified. You can log in."}
+
+        user.is_verified = True
+        db.add(user)
+        await db.commit()
+
+        return {"status": "success", "message": "Email successfully verified!"}
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Verification link expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid verification link")
+
+
+@router.post("/forgot-password")
+async def forgot_password(request: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User requests a password reset link.
+    """
+    result = await db.execute(select(User).where(User.email == request.email))
+    user = result.scalars().first()
+
+    # SECURITY BEST PRACTICE: Always return a generic success message
+    # even if the email doesn't exist, to prevent hackers from "email guessing"
+    if user:
+        reset_token = create_action_token(user.email, "reset_password")
+        await send_password_reset_email(user.email, reset_token)
+
+    return {"message": "If that email is registered, a password reset link has been sent."}
+
+
+@router.post("/reset-password")
+async def reset_password(payload: PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
+    """
+    Public Route: User submits their new password along with the secure token.
+    """
+    try:
+        decoded = jwt.decode(payload.token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email = decoded.get("sub")
+        token_type = decoded.get("type")
+
+        if token_type != "reset_password" or not email:
+            raise HTTPException(status_code=400, detail="Invalid token scope")
+
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Hash and save the new password
+        user.password_hash = get_password_hash(payload.new_password)
+        db.add(user)
+        await db.commit()
+
+        return {"status": "success", "message": "Password successfully reset!"}
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Reset link expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset link")
+
 
 

@@ -1,9 +1,10 @@
 import redis.asyncio as redis
+from app.core.config import settings
 
-# Connect to our local Docker Redis instance
+# Connect securely using environment variables
 redis_db = redis.Redis(
-    host="localhost",
-    port=6379,
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
     db=0,
     decode_responses=True
 )
@@ -18,3 +19,11 @@ async def check_redis_connection():
         print("Connected to Redis successfully!")
     except Exception as e:
         print(f"Failed to connect to Redis: {e}")
+
+
+async def close_redis_connection():
+    """
+    Safely closes the connection to Redis when shutting down the server
+    """
+    await redis_db.close()
+    print("Redis connection closed.")

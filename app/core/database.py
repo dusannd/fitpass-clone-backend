@@ -1,10 +1,9 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
+from app.core.config import settings
 
-# We will use a local PostgreSQL database
-# Format: postgresql+asyncpg://user:password@localhost:5432/database_name
-# Note: We will move this to a .env file later for security
-SQLALCHEMY_DATABASE_URL = "postgresql+asyncpg://postgres:admin@localhost:5433/fitpass_db"
+# Fetching the database URL securely from Pydantic settings (.env)
+SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL
 
 # Create async engine
 engine = create_async_engine(SQLALCHEMY_DATABASE_URL, echo=True)

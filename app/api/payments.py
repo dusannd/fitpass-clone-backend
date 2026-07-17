@@ -1,20 +1,22 @@
 import stripe
-import os
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import and_
 from datetime import datetime, timedelta, timezone
 
 from app.core.database import get_db
 from app.api.dependencies import get_current_user_id
 from app.models.subscription import SubscriptionPlan, UserSubscription
 
-# Load Stripe keys from environment variables
-stripe.api_key = os.getenv("STRIPE_API_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+# NOVO: Uvozimo settings
+from app.core.config import settings
+
+# Load Stripe keys directly from validated Pydantic settings
+stripe.api_key = settings.STRIPE_API_KEY
+STRIPE_WEBHOOK_SECRET = settings.STRIPE_WEBHOOK_SECRET
 
 router = APIRouter()
-
 
 @router.post("/checkout-session")
 async def create_checkout_session(

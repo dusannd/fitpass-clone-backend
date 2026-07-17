@@ -1,13 +1,12 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-import os
-from dotenv import load_dotenv
+from sqlalchemy.future import select
 
-load_dotenv()
-
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
+# NOVO: Svi uvozi su sada čisti i koriste Settings
+from app.core.config import settings
+from app.core.database import AsyncSessionLocal
+from app.models.user import User
 
 # This tells FastAPI to look for the "Authorization: Bearer <token>" header
 security = HTTPBearer()
@@ -20,8 +19,7 @@ def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(secu
     """
     token = credentials.credentials
     try:
-        # Decode the token using our secret key
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = payload.get("sub")
 
         if user_id is None:
@@ -44,24 +42,41 @@ class RequireRole:
     def __init__(self, required_role: str):
         self.required_role = required_role
 
-    def __call__(self, credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+    async def __call__(self, credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
         token = credentials.credentials
         try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             user_id = payload.get("sub")
 
-            # We now fetch the LIST of roles from the token
-            user_roles = payload.get("roles", [])
+            # This is what the token CLAIMS the user has
+            token_roles = payload.get("roles", [])
 
             if user_id is None:
                 raise HTTPException(status_code=401, detail="Invalid token structure")
 
-            # Check if the user has the required role in their list of roles
-            if self.required_role not in user_roles:
+            # 1. Check if the token claims they have the role
+            if self.required_role not in token_roles:
                 raise HTTPException(
                     status_code=403,
                     detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
                 )
+
+            # 2. ANTI-ZOMBIE TOKEN FIX: Verify against the actual database!
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(User).where(User.id == int(user_id)))
+                user = result.scalars().first()
+
+                if not user:
+                    raise HTTPException(status_code=401, detail="User no longer exists.")
+
+                # Fetch actual roles from the database via lazy loading
+                actual_roles = [role.name for role in await user.awaitable_attrs.roles]
+
+                if self.required_role not in actual_roles:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Your privileges have been revoked by an administrator."
+                    )
 
             return int(user_id)
 
@@ -72,5 +87,4 @@ class RequireRole:
 
 
 # For backward compatibility with our current admin routes
-# This automatically creates a dependency that checks for the "admin" role
 get_current_admin = RequireRole("admin")

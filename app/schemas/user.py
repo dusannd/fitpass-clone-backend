@@ -26,11 +26,12 @@ class UserResponse(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
     is_active: bool
-
+    is_verified: bool
+    
     # We replaced 'role: str' with a list of roles!
     roles: List[RoleResponse] = []
 
-    # NEW: Admin frontend needs to see active subscriptions easily
+    # Admin frontend needs to see active subscriptions easily
     subscriptions: List[UserSubscriptionResponse] = []
 
     class Config:
@@ -46,3 +47,20 @@ class UserLogin(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+# --- HR PANEL SCHEMAS ---
+class RoleManageRequest(BaseModel):
+    """
+    Schema for assigning or revoking roles via the Admin HR panel.
+    """
+    email: EmailStr
+    role_name: str
+
+
+# --- PASSWORD RESET SCHEMAS ---
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
