@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from app.api.dependencies import RequireRole, get_current_user_id
 import jwt
 
 from app.core.rate_limit import limiter
@@ -135,6 +136,28 @@ async def login(
 
 
 get_current_admin = RequireRole("admin")
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_my_profile(
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Vraća profil trenutno ulogovanog korisnika na osnovu JWT tokena.
+    """
+    stmt = (
+        select(User)
+        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .where(User.id == current_user_id)
+    )
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return user
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

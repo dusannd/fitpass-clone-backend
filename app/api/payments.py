@@ -71,9 +71,9 @@ async def create_checkout_session(
                 }
             ],
             mode='payment',
-            # URLs where Stripe will redirect the user after payment (Usually Frontend URLs)
-            success_url="http://localhost:8000/docs?payment=success",
-            cancel_url="http://localhost:8000/docs?payment=cancelled",
+            # URLs where Stripe will redirect the user after payment
+            success_url="http://localhost:5173/member/dashboard?payment=success",
+            cancel_url="http://localhost:5173/member/dashboard?payment=cancelled",
 
             # CRITICAL: We attach user_id and plan_id to metadata.
             # Stripe will send this back to our webhook so we know WHO paid for WHAT.
