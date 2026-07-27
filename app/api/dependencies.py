@@ -2,6 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 
 # NOVO: Svi uvozi su sada čisti i koriste Settings
 from app.core.config import settings
@@ -63,15 +64,15 @@ class RequireRole:
 
             # 2. ANTI-ZOMBIE TOKEN FIX: Verify against the actual database!
             async with AsyncSessionLocal() as db:
-                result = await db.execute(select(User).where(User.id == int(user_id)))
+                result = await db.execute(select(User).options(selectinload(User.roles)).where(User.id == int(user_id)))
                 user = result.scalars().first()
 
                 if not user:
                     raise HTTPException(status_code=401, detail="User no longer exists.")
 
                 # Fetch actual roles from the database via lazy loading
-                actual_roles = [role.name for role in await user.awaitable_attrs.roles]
-
+                actual_roles = [role.name for role in user.roles]
+                
                 if self.required_role not in actual_roles:
                     raise HTTPException(
                         status_code=403,
