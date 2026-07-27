@@ -26,8 +26,7 @@ class UserResponse(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
     is_active: bool
-    is_verified: bool
-    
+    is_verified: Optional[bool] = False
     # We replaced 'role: str' with a list of roles!
     roles: List[RoleResponse] = []
 
