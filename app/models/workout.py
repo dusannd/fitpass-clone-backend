@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, Float
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, Float, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -47,9 +47,11 @@ class Exercise(Base):
     sets = Column(Integer, default=3)
     reps = Column(String, nullable=False)
     rest_time_seconds = Column(Integer, default=60, nullable=True)
+    requires_weight = Column(Boolean, default=True, nullable=False)
 
     # Relationship back to the parent plan
     plan = relationship("WorkoutPlan", back_populates="exercises")
+
 
 
 class WorkoutSession(Base):

@@ -9,6 +9,7 @@ class ExerciseCreate(BaseModel):
     sets: int = 3
     reps: str
     rest_time_seconds: Optional[int] = 60
+    requires_weight: bool = True
 
 
 class ExerciseResponse(BaseModel):
@@ -17,7 +18,7 @@ class ExerciseResponse(BaseModel):
     sets: int
     reps: str
     rest_time_seconds: Optional[int]
-
+    requires_weight: bool        
     class Config:
         from_attributes = True
 

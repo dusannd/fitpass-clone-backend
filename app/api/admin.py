@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import List
 
 from app.core.database import get_db
@@ -203,3 +203,44 @@ async def fire_staff(
         "status": "success",
         "message": f"Role '{request.role_name}' has been revoked from {user.email}."
     }
+
+
+from datetime import timedelta
+
+@router.get("/analytics/weekly")
+async def get_weekly_attendance(
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    Returns real attendance counts for the last 7 days grouped by day.
+    """
+    today = date.today()
+    seven_days_ago = today - timedelta(days=6)
+
+    # Query all successful entry logs in the last 7 days
+    result = await db.execute(
+        select(EntryLog).where(
+            func.date(EntryLog.timestamp) >= seven_days_ago,
+            EntryLog.access_granted == True
+        )
+    )
+    logs = result.scalars().all()
+
+    # Initialize last 7 days map (e.g. Mon, Tue, Wed...)
+    days_map = {}
+    for i in range(7):
+        day_date = seven_days_ago + timedelta(days=i)
+        day_name = day_date.strftime("%a")  # Mon, Tue, Wed...
+        days_map[day_name] = 0
+
+    # Count real entries per day
+    for log in logs:
+        if log.timestamp:
+            day_name = log.timestamp.strftime("%a")
+            if day_name in days_map:
+                days_map[day_name] += 1
+
+    # Format response for Recharts
+    weekly_data = [{"day": day, "entries": count} for day, count in days_map.items()]
+    return weekly_data
