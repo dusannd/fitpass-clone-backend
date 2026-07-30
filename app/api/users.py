@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -24,7 +24,11 @@ get_current_admin = RequireRole("admin")
 
 
 @router.post("/", response_model=UserResponse)
-async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
+async def create_user(
+        user: UserCreate,
+        background_tasks: BackgroundTasks, 
+        db: AsyncSession = Depends(get_db)
+):
     # 1. Check if user with this email already exists
     result = await db.execute(select(User).where(User.email == user.email))
     existing_user = result.scalars().first()
@@ -40,12 +44,10 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         password_hash=hashed_password,
         first_name=user.first_name,
         last_name=user.last_name,
-        # SECURE FIX: Auto-verify only if we are actively running Pytest!
         is_verified=True if (user.email.endswith("@test.com") and getattr(settings, "TESTING", False)) else False
     )
 
     # 4. ASSIGN DEFAULT ROLE
-    # Ensure the 'member' role exists in the database. If not, create it dynamically.
     role_result = await db.execute(select(Role).where(Role.name == "member"))
     default_role = role_result.scalars().first()
 
@@ -55,8 +57,6 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         await db.commit()
         await db.refresh(default_role)
 
-    # Add the role to the user's list of roles
-    # (SQLAlchemy automatically handles the user_roles Many-to-Many association table)
     new_user.roles.append(default_role)
 
     # 5. Save to database
@@ -64,9 +64,6 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(new_user)
 
-    # FIX for async sqlalchemy (MissingGreenlet Error):
-    # We must explicitly reload the user with all necessary relationships (roles, subscriptions)
-    # before returning it to Pydantic for serialization.
     stmt = (
         select(User)
         .options(selectinload(User.roles), selectinload(User.subscriptions))
@@ -75,8 +72,12 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     created_user = result.scalars().first()
 
+    # 6. SEND EMAIL IN THE BACKGROUND
     verification_token = create_action_token(created_user.email, "verify_email")
-    await send_verification_email(created_user.email, verification_token)
+
+    # <--- 2. USE BACKGROUND_TASKS.ADD_TASK INSTEAD OF AWAIT --->
+    # The server will return the response immediately and run this function in the background.
+    background_tasks.add_task(send_verification_email, created_user.email, verification_token)
 
     return created_user
 

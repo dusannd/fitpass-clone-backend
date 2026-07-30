@@ -1,11 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 
 class Settings(BaseSettings):
-    """
-    Application settings loaded from .env file.
-    Pydantic automatically validates these types.
-    """
     DATABASE_URL: str
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
@@ -17,8 +14,21 @@ class Settings(BaseSettings):
     STRIPE_API_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
 
+    # --- EMAIL SETTINGS ---
+    EMAIL_FROM: str = "onboarding@resend.dev"
+
+    # Resend API Key MUST be defined here
+    RESEND_API_KEY: Optional[str] = None
+
+    # SMTP Fallbacks
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASS: Optional[str] = None
+
+    TESTING: bool = False
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
-# Create a global settings object
 settings = Settings()
