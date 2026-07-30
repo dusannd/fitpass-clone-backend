@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional, List, Any
 
 from app.schemas.subscription import UserSubscriptionResponse
@@ -18,6 +18,8 @@ class UserCreate(BaseModel):
     password: str
     first_name: str
     last_name: str
+    # HONEYPOT FIELD: Real users will send None. Bots will fill this out.
+    extra_info: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -33,15 +35,14 @@ class UserResponse(BaseModel):
     # Admin frontend needs to see active subscriptions easily
     subscriptions: List[UserSubscriptionResponse] = []
 
-    class Config:
-        from_attributes = True
-
+model_config = ConfigDict(from_attributes=True)
 
 # --- SCHEMA FOR LOGIN ---
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
-
+    # HONEYPOT FIELD: Used to catch bot login brute-force attempts.
+    extra_info: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str

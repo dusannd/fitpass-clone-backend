@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional
 
@@ -46,5 +46,4 @@ class AdminEntryLogResponse(BaseModel):
     worker: Optional[BasicUser] = None
     user: Optional[BasicUser] = None  # We need this to see who entered during the audit
 
-    class Config:
-        from_attributes = True
+model_config = ConfigDict(from_attributes=True)

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -25,10 +26,17 @@ get_current_admin = RequireRole("admin")
 
 @router.post("/", response_model=UserResponse)
 async def create_user(
-        user: UserCreate,
-        background_tasks: BackgroundTasks,
-        db: AsyncSession = Depends(get_db)
+    user: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
 ):
+    # 0. SECURITY: Honeypot Check (Bot trap)
+    if user.extra_info:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
+        )
+
     # 1. Check if user with this email already exists
     result = await db.execute(select(User).where(User.email == user.email))
     existing_user = result.scalars().first()
@@ -106,6 +114,13 @@ async def login(
     user_credentials: UserLogin,
     db: AsyncSession = Depends(get_db)
 ):
+
+    # 0. SECURITY: Honeypot Check (Bot trap)
+    if user_credentials.extra_info:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
+        )
 
     # 1. Fetch user from the database by email
     result = await db.execute(select(User).where(User.email == user_credentials.email))
