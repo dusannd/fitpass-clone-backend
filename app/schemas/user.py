@@ -63,3 +63,11 @@ class PasswordResetRequest(BaseModel):
 class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str
+
+
+# --- EMAIL VERIFICATION SCHEMAS ---
+class ResendVerificationRequest(BaseModel):
+    """
+    Schema for requesting a new verification email.
+    """
+    email: EmailStr

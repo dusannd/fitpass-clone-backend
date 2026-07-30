@@ -11,7 +11,7 @@ from app.core.rate_limit import limiter
 from app.models.user import User, Role
 from app.core.database import get_db
 from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
-PasswordResetRequest, PasswordResetConfirm)
+PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest)
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.config import settings
 from app.api.dependencies import RequireRole
@@ -26,7 +26,7 @@ get_current_admin = RequireRole("admin")
 @router.post("/", response_model=UserResponse)
 async def create_user(
         user: UserCreate,
-        background_tasks: BackgroundTasks, 
+        background_tasks: BackgroundTasks,
         db: AsyncSession = Depends(get_db)
 ):
     # 1. Check if user with this email already exists
@@ -194,6 +194,35 @@ async def delete_user(
 # ==========================================
 # EMAIL VERIFICATION & PASSWORD RESET
 # ==========================================
+
+
+@router.post("/resend-verification")
+@limiter.limit("1/15minutes")
+async def resend_verification(
+    request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    payload: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Public Route: Allows a user to request a new email verification link.
+    Rate limited to 1 request per 15 minutes to prevent email spam.
+    """
+    # 1. Look up the user by email
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalars().first()
+
+    # 2. Security Check: We use a generic response to prevent email enumeration.
+    # We only trigger the email if the user exists AND they are NOT verified yet.
+    if user and not user.is_verified:
+        verification_token = create_action_token(user.email, "verify_email")
+        # Send the email in the background so the endpoint returns instantly
+        background_tasks.add_task(send_verification_email, user.email, verification_token)
+
+    # 3. Always return a 200 OK with the same message, regardless of whether the email exists.
+    return {
+        "message": "If this email is registered and unverified, a new verification link has been sent."
+    }
 
 @router.get("/verify-email")
 async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
