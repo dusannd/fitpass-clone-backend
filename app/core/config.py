@@ -14,10 +14,12 @@ class Settings(BaseSettings):
     STRIPE_API_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
 
+    # --- NEW: SECURITY & ANTI-SPAM SETTINGS ---
+    FEATURE_RECAPTCHA: bool = False
+    RECAPTCHA_SECRET: str = ""
+
     # --- EMAIL SETTINGS ---
     EMAIL_FROM: str = "onboarding@resend.dev"
-
-    # Resend API Key MUST be defined here
     RESEND_API_KEY: Optional[str] = None
 
     # SMTP Fallbacks

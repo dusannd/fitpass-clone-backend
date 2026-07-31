@@ -17,6 +17,8 @@ from app.core.security import get_password_hash, verify_password, create_access_
 from app.core.config import settings
 from app.api.dependencies import RequireRole
 from app.services.email import create_action_token, send_verification_email, send_password_reset_email
+from app.services.recaptcha import verify_recaptcha
+
 
 router = APIRouter()
 
@@ -36,6 +38,9 @@ async def create_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
         )
+
+    # ---> NEW: 0.5 SECURITY: reCAPTCHA Verification <---
+    await verify_recaptcha(user.recaptcha_token)
 
     # 1. Check if user with this email already exists
     result = await db.execute(select(User).where(User.email == user.email))
@@ -121,6 +126,9 @@ async def login(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
         )
+
+    # ---> NEW: 0.5 SECURITY: reCAPTCHA Verification <---
+    await verify_recaptcha(user_credentials.recaptcha_token)
 
     # 1. Fetch user from the database by email
     result = await db.execute(select(User).where(User.email == user_credentials.email))

@@ -20,6 +20,8 @@ class UserCreate(BaseModel):
     last_name: str
     # HONEYPOT FIELD: Real users will send None. Bots will fill this out.
     extra_info: Optional[str] = None
+    # NEW: reCAPTCHA token from the frontend
+    recaptcha_token: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -43,6 +45,8 @@ class UserLogin(BaseModel):
     password: str
     # HONEYPOT FIELD: Used to catch bot login brute-force attempts.
     extra_info: Optional[str] = None
+    # NEW: reCAPTCHA token from the frontend
+    recaptcha_token: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str
