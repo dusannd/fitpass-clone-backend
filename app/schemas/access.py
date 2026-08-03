@@ -4,7 +4,7 @@ from typing import Optional
 
 class QRTokenResponse(BaseModel):
     qr_token: str
-    expires_in_seconds: int = 60
+    expires_in_seconds: int = 300
 
 # --- NEW: Schema for generating QR ---
 class GenerateQRRequest(BaseModel):

@@ -29,13 +29,36 @@ async def generate_qr_code(
         user_id: int = Depends(get_current_member)
 ):
     """
-    User requests a QR code. They must specify if they intend to ENTER or EXIT.
+    Generates a secure QR token.
+    Includes Rate Limiting and pre-emptive Anti-Passback checks.
     """
     if request.action_type not in ["ENTRY", "EXIT"]:
         raise HTTPException(status_code=400, detail="Invalid action type. Must be ENTRY or EXIT.")
 
+    # 1. RATE LIMITING: Prevent spamming (1 QR per 30 seconds)
+    rate_limit_key = f"qr_rate_limit:{user_id}"
+    is_allowed = await redis_db.set(rate_limit_key, "1", ex=30, nx=True)
+
+    if not is_allowed:
+        ttl = await redis_db.ttl(rate_limit_key)
+        ttl = max(1, ttl)  # Ensure TTL doesn't return negative
+        raise HTTPException(status_code=429, detail=f"Please wait {ttl} seconds before generating a new code.")
+
+    # 2. ANTI-PASSBACK PRE-CHECK: Prevent illogical generation
+    status_key = f"user_status:{user_id}"
+    current_status = await redis_db.get(status_key) or "OUTSIDE"
+
+    if request.action_type == "ENTRY" and current_status == "INSIDE":
+        await redis_db.delete(rate_limit_key)  # Free the rate limit so they can select EXIT
+        raise HTTPException(status_code=400, detail="You are already INSIDE. Please select Check Out.")
+
+    if request.action_type == "EXIT" and current_status == "OUTSIDE":
+        await redis_db.delete(rate_limit_key)  # Free the rate limit
+        raise HTTPException(status_code=400, detail="You are currently OUTSIDE. Please select Check In.")
+
+    # 3. GENERATE TOKEN
     token = create_qr_token(user_id=user_id, action_type=request.action_type)
-    return {"qr_token": token, "expires_in_seconds": 60}
+    return {"qr_token": token, "expires_in_seconds": 300}
 
 
 @router.websocket("/ws")
@@ -44,7 +67,6 @@ async def websocket_endpoint(websocket: WebSocket):
     Secure WebSocket endpoint. Reads the HTTP-Only cookie automatically sent by the browser.
     """
     try:
-        # Extract token securely from the cookie
         token = websocket.cookies.get("access_token")
         if not token:
             await websocket.close(code=1008, reason="Missing authentication cookie")
@@ -75,24 +97,25 @@ async def scan_qr_code(
         worker_id: int = Depends(get_current_worker)
 ):
     """
-    Turnstile scanner endpoint. Validates QR, checks Anti-Passback via Redis, logs it, and triggers WebSockets.
+    Turnstile scanner endpoint. Validates QR, checks Anti-Passback, burns the JTI, and logs it.
     """
     now = datetime.now(timezone.utc)
 
-    # 1. DECODE & VALIDATE JWT QR TOKEN
+    # 1. DECODE & EXTRACT METADATA
     try:
         decoded_token = jwt.decode(payload.qr_token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = int(decoded_token.get("sub"))
         token_type = decoded_token.get("type")
         action_type = decoded_token.get("action_type")
+        jti = decoded_token.get("jti")  # Get Unique Token ID
 
-        if token_type != "qr_access":
-            raise HTTPException(status_code=400, detail="Invalid token type used.")
+        if token_type != "qr_access" or not jti:
+            raise HTTPException(status_code=400, detail="Invalid token structure.")
 
         # Intent validation
         if action_type != payload.scan_type:
             await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                                 f"Mismatched intent: Tried {action_type} at {payload.scan_type} turnstile.")
+                                 f"Intent mismatch: Scanned {action_type} at {payload.scan_type} turnstile.")
             raise HTTPException(status_code=400, detail="Turnstile mismatch.")
 
     except jwt.ExpiredSignatureError:
@@ -100,21 +123,31 @@ async def scan_qr_code(
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=400, detail="Invalid QR Code.")
 
-    # 2. REDIS ANTI-PASSBACK
+    # 2. ATOMIC SCREENSHOT/REPLAY PREVENTION
+    # Attempts to save the JTI to Redis. If it already exists, nx=True returns False/None.
+    jti_key = f"consumed_jti:{jti}"
+    is_first_scan = await redis_db.set(jti_key, "1", ex=300, nx=True)
+
+    if not is_first_scan:
+        await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
+                             "Replay Attack: Token already consumed.")
+        raise HTTPException(status_code=403, detail="Code already used. Screenshots are strictly forbidden.")
+
+    # 3. REDIS ANTI-PASSBACK
     redis_key = f"user_status:{user_id}"
     current_status = await redis_db.get(redis_key) or "OUTSIDE"
 
     if action_type == "ENTRY" and current_status == "INSIDE":
         await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
                              "Anti-Passback Violation: Already inside.")
-        raise HTTPException(status_code=403, detail="Anti-Passback Error: You are already inside the gym.")
+        raise HTTPException(status_code=403, detail="Passback Error: You are already inside the gym.")
 
     if action_type == "EXIT" and current_status == "OUTSIDE":
         await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
                              "Anti-Passback Violation: Not checked in.")
-        raise HTTPException(status_code=403, detail="Anti-Passback Error: You cannot exit if you haven't entered.")
+        raise HTTPException(status_code=403, detail="Passback Error: You cannot exit if you haven't entered.")
 
-    # 3. CHECK SUBSCRIPTION VALIDITY (ONLY FOR ENTRY)
+    # 4. CHECK SUBSCRIPTION VALIDITY (ONLY FOR ENTRY)
     if action_type == "ENTRY":
         stmt = (
             select(UserSubscription)
@@ -135,7 +168,7 @@ async def scan_qr_code(
                                  "No active subscription found.")
             raise HTTPException(status_code=403, detail="Access Denied: No active subscription.")
 
-    # 4. SUCCESS: UPDATE REDIS STATE & LOG
+    # 5. SUCCESS: UPDATE REDIS STATE & LOG
     new_status = "INSIDE" if action_type == "ENTRY" else "OUTSIDE"
     await redis_db.set(redis_key, new_status)
 
