@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.core.rate_limit import limiter
+from app.core.config import settings
 
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
@@ -44,10 +45,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # React Frontend (Vite)
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins = settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

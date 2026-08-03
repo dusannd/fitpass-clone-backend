@@ -75,12 +75,18 @@ class UserSubscription(Base):
     __tablename__ = "user_subscriptions"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    plan_id = Column(Integer, ForeignKey("subscription_plans.id", ondelete="CASCADE"), nullable=False)
+
+    # ADDED index=True for much faster lookups by user
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # ADDED index=True for grouping/analytics by plan
+    plan_id = Column(Integer, ForeignKey("subscription_plans.id", ondelete="CASCADE"), nullable=False, index=True)
 
     start_date = Column(DateTime(timezone=True), server_default=func.now())
     end_date = Column(DateTime(timezone=True), nullable=False)
-    is_active = Column(Integer, default=1)  # 1 = Active, 0 = Expired
+
+    # ADDED index=True because we constantly query WHERE is_active = 1
+    is_active = Column(Integer, default=1, index=True)
 
     # Relationship to fetch plan details easily
     plan = relationship("SubscriptionPlan", back_populates="user_subscriptions")

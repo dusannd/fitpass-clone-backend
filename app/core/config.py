@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, List
 
 
 class Settings(BaseSettings):
@@ -13,6 +13,12 @@ class Settings(BaseSettings):
 
     STRIPE_API_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+
+    # --- NEW: URL & CORS SETTINGS ---
+    # Fallback to localhost if not provided in .env
+    FRONTEND_URL: str = "http://localhost:5173"
+    # Note: Pydantic parses comma-separated strings into lists automatically if defined as list
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     # --- NEW: SECURITY & ANTI-SPAM SETTINGS ---
     FEATURE_RECAPTCHA: bool = False

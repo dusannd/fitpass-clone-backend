@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks, Query, Response
 from fastapi.responses import JSONResponse
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,28 +94,35 @@ async def create_user(
 
     return created_user
 
-
 @router.get("/", response_model=list[UserResponse])
 async def get_all_users(
+    skip: int = Query(0, ge=0, description="Pagination offset"),
+    limit: int = Query(50, ge=1, le=100, description="Max 100 records per page"),
     db: AsyncSession = Depends(get_db),
-    admin_id: int = Depends(get_current_admin) # <--- ZAKLJUČANO ZA ADMINA
+    admin_id: int = Depends(get_current_admin)
 ):
     """
-    Admin Dashboard route: Fetch all users along with their roles and subscriptions.
+    Admin Dashboard route: Fetch paginated users along with their roles and subscriptions.
     """
-    # Fetch users, and join their roles AND their subscriptions in one fast query
-    stmt = select(User).options(
-        selectinload(User.roles),
-        selectinload(User.subscriptions) # Puni listu pretplata za front-end
+    # Fetch users, applying limit and offset for pagination
+    stmt = (
+        select(User)
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions)
+        )
+        .offset(skip)
+        .limit(limit)
     )
     result = await db.execute(stmt)
     users = result.scalars().all()
     return users
 
-@router.post("/login", response_model=Token)
+@router.post("/login")
 @limiter.limit("5/minute")
 async def login(
     request: Request,
+    response: Response,
     user_credentials: UserLogin,
     db: AsyncSession = Depends(get_db)
 ):
@@ -149,15 +156,28 @@ async def login(
         )
 
     # 3. EXTRACT ROLES
-    # Extract just the role names into a flat list, e.g., ["member", "admin"]
+    # Extract roles
     role_names = [role.name for role in user.roles]
 
-    # 4. Generate the JWT access token (packing the list of roles into the token)
+    # Generate the JWT access token
     access_token = create_access_token(data={"sub": str(user.id), "roles": role_names})
 
-    # 5. Return the token to the client
-    return {"access_token": access_token, "token_type": "bearer"}
+    # --- NEW: SET HTTP-ONLY COOKIE ---
+    # We calculate the max_age in seconds
+    max_age_seconds = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
 
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,  # Prevents XSS attacks (JS cannot read it)
+        secure=not settings.TESTING,  # True in production (HTTPS required)
+        samesite="lax",  # CSRF protection
+        max_age=max_age_seconds,
+        expires=max_age_seconds,
+    )
+
+    # We no longer need to return the token in the JSON body
+    return {"message": "Successfully logged in"}
 
 get_current_admin = RequireRole("admin")
 
@@ -333,3 +353,11 @@ async def reset_password(payload: PasswordResetConfirm, db: AsyncSession = Depen
 
 
 
+# --- NEW: ADD LOGOUT ENDPOINT ---
+@router.post("/logout")
+async def logout(response: Response):
+    """
+    Clears the httpOnly cookie to log the user out.
+    """
+    response.delete_cookie("access_token", httponly=True, samesite="lax")
+    return {"message": "Successfully logged out"}
