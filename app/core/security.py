@@ -31,13 +31,20 @@ def create_access_token(data: dict) -> str:
     return encoded_jwt
 
 
-def create_qr_token(user_id: int) -> str:
+def create_qr_token(user_id: int, action_type: str) -> str:
     """
-    Creates a very short-lived JWT token specifically for the QR code.
-    Expires in 1 minute to prevent QR code screenshot sharing.
+    Creates a strictly 60-second short-lived JWT token for the QR code.
+    Embeds the 'action_type' (ENTRY/EXIT) to prevent spoofing the turnstiles.
     """
-    expire = datetime.now(timezone.utc) + timedelta(minutes=1)
-    to_encode = {"sub": str(user_id), "type": "qr_access", "exp": expire}
+    # Expiration is exactly 60 seconds from generation to prevent screenshot sharing
+    expire = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    to_encode = {
+        "sub": str(user_id),
+        "type": "qr_access",
+        "action_type": action_type,  # CRITICAL: Intent of the QR code
+        "exp": expire
+    }
 
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt

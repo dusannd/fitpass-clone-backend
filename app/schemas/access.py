@@ -6,15 +6,21 @@ class QRTokenResponse(BaseModel):
     qr_token: str
     expires_in_seconds: int = 60
 
+# --- NEW: Schema for generating QR ---
+class GenerateQRRequest(BaseModel):
+    action_type: str  # Expected: "ENTRY" or "EXIT"
+
 class ScanRequest(BaseModel):
     qr_token: str
     location_id: int
+    scan_type: str #Expected "ENTRY" or "EXIT"
 
 
 class ScanResponse(BaseModel):
     access_granted: bool
     message: str
     user_id: int
+    action_type: Optional[str] = None #Tells the scanner what action was performed
 
 
 # --- ADMIN ANALYTICS SCHEMAS ---
@@ -40,6 +46,7 @@ class AdminEntryLogResponse(BaseModel):
     timestamp: datetime
     access_granted: bool
     reason: Optional[str]
+    action_type: str #Admin audit logs
 
     # Nested relationships (FastAPI will automatically extract these from the DB models!)
     location: Optional[BasicLocation] = None
