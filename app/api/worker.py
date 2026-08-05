@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_
+from sqlalchemy import and_, func
+from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
 
 from app.core.database import get_db
@@ -119,3 +120,85 @@ async def check_user_status(
         "expires_on": user_sub.end_date,
         "message": "Subscription active. Allowed to enter."
     }
+
+
+@router.get("/currently-inside")
+async def get_currently_inside(
+        db: AsyncSession = Depends(get_db),
+        worker_id: int = Depends(get_current_worker)
+):
+    """
+    Worker Dashboard: Returns a list of all users currently inside the gym.
+    Uses a SQL Subquery to find the absolute latest log for each user,
+    and checks if that latest log was a successful 'ENTRY'.
+    """
+    # 1. Subquery: Find the MAX timestamp (latest log) for each user
+    subq = (
+        select(EntryLog.user_id, func.max(EntryLog.timestamp).label("max_ts"))
+        .group_by(EntryLog.user_id)
+        .subquery()
+    )
+
+    # 2. Main Query: Join EntryLog with the subquery to get the actual row data
+    stmt = (
+        select(EntryLog)
+        .join(
+            subq,
+            and_(
+                EntryLog.user_id == subq.c.user_id,
+                EntryLog.timestamp == subq.c.max_ts
+            )
+        )
+        .where(
+            EntryLog.action_type == "ENTRY",
+            EntryLog.access_granted == True
+        )
+        .options(selectinload(EntryLog.user))  # Eager load user data
+        .order_by(EntryLog.timestamp.desc())
+    )
+
+    result = await db.execute(stmt)
+    active_logs = result.scalars().all()
+
+    # 3. Format the response for the frontend
+    response = []
+    for log in active_logs:
+        response.append({
+            "user_id": log.user.id,
+            "full_name": f"{log.user.first_name} {log.user.last_name}",
+            "email": log.user.email,
+            "entered_at": log.timestamp
+        })
+
+    return response
+
+
+@router.post("/force-checkout/{target_user_id}")
+async def force_checkout(
+        target_user_id: int,
+        db: AsyncSession = Depends(get_db),
+        worker_id: int = Depends(get_current_worker)
+):
+    """
+    Worker Dashboard: Forcefully checks out a user if they forgot to scan the exit QR.
+    Frees up their Redis status so they can enter again next time.
+    """
+    # Import inside the function to avoid circular import issues
+    from app.core.redis_client import redis_db
+
+    # 1. Reset Redis state to OUTSIDE
+    redis_key = f"user_status:{target_user_id}"
+    await redis_db.set(redis_key, "OUTSIDE")
+
+    # 2. Write a manual EXIT log to the database
+    entry_log = EntryLog(
+        user_id=target_user_id,
+        worker_id=worker_id,
+        access_granted=True,
+        action_type="EXIT",
+        reason="Force Checkout by Worker"
+    )
+    db.add(entry_log)
+    await db.commit()
+
+    return {"status": "success", "message": "User has been forcefully checked out."}

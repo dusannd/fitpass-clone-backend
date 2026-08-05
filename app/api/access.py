@@ -2,7 +2,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_
+from sqlalchemy import and_, desc
 from datetime import datetime, timezone
 
 from app.core.config import settings
@@ -206,3 +206,45 @@ async def log_and_notify(db: AsyncSession, user_id: int, worker_id: int, locatio
         },
         user_id=user_id
     )
+
+
+@router.get("/my-status")
+async def get_my_status(
+        db: AsyncSession = Depends(get_db),
+        user_id: int = Depends(get_current_member)
+):
+    """
+    Returns the user's current physical status (INSIDE/OUTSIDE)
+    and the timestamp of their entry if they are currently inside.
+    """
+    # 1. Check the current state in Redis
+    status_key = f"user_status:{user_id}"
+    current_status = await redis_db.get(status_key) or "OUTSIDE"
+
+    entered_at = None
+
+    # 2. If the user is inside, find the exact entry timestamp from the database
+    #    so the frontend can calculate the session duration.
+    if current_status == "INSIDE":
+        stmt = (
+            select(EntryLog)
+            .where(
+                and_(
+                    EntryLog.user_id == user_id,
+                    EntryLog.action_type == "ENTRY",
+                    EntryLog.access_granted == True
+                )
+            )
+            .order_by(desc(EntryLog.timestamp))
+            .limit(1)
+        )
+        result = await db.execute(stmt)
+        last_entry = result.scalars().first()
+
+        if last_entry:
+            entered_at = last_entry.timestamp
+
+    return {
+        "status": current_status,
+        "entered_at": entered_at
+    }
