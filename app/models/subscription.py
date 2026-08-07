@@ -88,5 +88,9 @@ class UserSubscription(Base):
     # ADDED index=True because we constantly query WHERE is_active = 1
     is_active = Column(Integer, default=1, index=True)
 
+    # Stripe's recurring subscription ID (sub_...). Used to reconcile renewal/cancellation
+    # webhooks against the right row. Nullable for legacy one-time-payment subscriptions.
+    stripe_subscription_id = Column(String, nullable=True, index=True)
+
     # Relationship to fetch plan details easily
     plan = relationship("SubscriptionPlan", back_populates="user_subscriptions")
