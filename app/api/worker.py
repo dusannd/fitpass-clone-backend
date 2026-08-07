@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
 
 from app.core.database import get_db
+from app.core.websockets import ws_manager
 from app.models.user import User
 from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan
@@ -52,6 +53,17 @@ async def manual_entry_override(
     db.add(entry_log)
     await db.commit()
     await db.refresh(entry_log)
+
+    # Notify the member's dashboard in real-time so it resyncs instantly
+    await ws_manager.send_personal_message(
+        message={
+            "type": "ACCESS_EVENT",
+            "access_granted": True,
+            "action_type": "ENTRY",
+            "reason": "Manual Override"
+        },
+        user_id=target_user.id
+    )
 
     return {
         "status": "success",
@@ -200,5 +212,16 @@ async def force_checkout(
     )
     db.add(entry_log)
     await db.commit()
+
+    # Notify the member's dashboard in real-time so it resyncs instantly
+    await ws_manager.send_personal_message(
+        message={
+            "type": "ACCESS_EVENT",
+            "access_granted": True,
+            "action_type": "EXIT",
+            "reason": "Force Checkout"
+        },
+        user_id=target_user_id
+    )
 
     return {"status": "success", "message": "User has been forcefully checked out."}

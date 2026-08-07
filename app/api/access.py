@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_, desc
+from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
 
 from app.core.config import settings
@@ -12,7 +13,7 @@ from app.core.redis_client import redis_db
 from app.core.websockets import ws_manager
 
 from app.models.access import EntryLog
-from app.models.subscription import UserSubscription, SubscriptionPlan
+from app.models.subscription import UserSubscription, SubscriptionPlan, SubscriptionRule, plan_locations
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse, GenerateQRRequest
 from app.api.dependencies import RequireRole
 
@@ -23,9 +24,40 @@ get_current_worker = RequireRole("worker")
 get_current_member = RequireRole("member")
 
 
+async def resolve_user_status(db: AsyncSession, user_id: int, status_key: str) -> str:
+    """
+    Returns the user's current physical status from Redis. If Redis has no
+    record of it (cold cache, eviction, restart), reconstructs the status from
+    the user's last successful EntryLog and re-seeds Redis with it so future
+    lookups stay cheap.
+    """
+    cached_status = await redis_db.get(status_key)
+    if cached_status is not None:
+        return cached_status
+
+    stmt = (
+        select(EntryLog)
+        .where(
+            and_(
+                EntryLog.user_id == user_id,
+                EntryLog.access_granted == True
+            )
+        )
+        .order_by(desc(EntryLog.timestamp))
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    last_log = result.scalars().first()
+
+    resolved_status = "INSIDE" if last_log and last_log.action_type == "ENTRY" else "OUTSIDE"
+    await redis_db.set(status_key, resolved_status)
+    return resolved_status
+
+
 @router.post("/generate", response_model=QRTokenResponse)
 async def generate_qr_code(
         request: GenerateQRRequest,
+        db: AsyncSession = Depends(get_db),
         user_id: int = Depends(get_current_member)
 ):
     """
@@ -46,7 +78,7 @@ async def generate_qr_code(
 
     # 2. ANTI-PASSBACK PRE-CHECK: Prevent illogical generation
     status_key = f"user_status:{user_id}"
-    current_status = await redis_db.get(status_key) or "OUTSIDE"
+    current_status = await resolve_user_status(db, user_id, status_key)
 
     if request.action_type == "ENTRY" and current_status == "INSIDE":
         await redis_db.delete(rate_limit_key)  # Free the rate limit so they can select EXIT
@@ -135,7 +167,7 @@ async def scan_qr_code(
 
     # 3. REDIS ANTI-PASSBACK
     redis_key = f"user_status:{user_id}"
-    current_status = await redis_db.get(redis_key) or "OUTSIDE"
+    current_status = await resolve_user_status(db, user_id, redis_key)
 
     if action_type == "ENTRY" and current_status == "INSIDE":
         await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
@@ -152,6 +184,12 @@ async def scan_qr_code(
         stmt = (
             select(UserSubscription)
             .join(SubscriptionPlan, UserSubscription.plan_id == SubscriptionPlan.id)
+            .outerjoin(plan_locations, plan_locations.c.plan_id == SubscriptionPlan.id)
+            .outerjoin(SubscriptionRule, SubscriptionRule.plan_id == SubscriptionPlan.id)
+            .options(
+                selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.locations),
+                selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.rule),
+            )
             .where(
                 and_(
                     UserSubscription.user_id == user_id,
@@ -159,6 +197,7 @@ async def scan_qr_code(
                     UserSubscription.end_date > now
                 )
             )
+            .distinct()
         )
         result = await db.execute(stmt)
         active_sub = result.scalars().first()
@@ -167,6 +206,32 @@ async def scan_qr_code(
             await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
                                  "No active subscription found.")
             raise HTTPException(status_code=403, detail="Access Denied: No active subscription.")
+
+        # 4a. LOCATION CHECK: Does this plan grant access to the scanned gym?
+        allowed_location_ids = [loc.id for loc in active_sub.plan.locations]
+        if payload.location_id not in allowed_location_ids:
+            await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
+                                 "Access Denied: Your plan does not include this location.")
+            raise HTTPException(status_code=403, detail="Access Denied: Your plan does not include this location.")
+
+        # 4b. TIME/DAY RULE CHECK: Plans without a rule are unrestricted (24/7, every day)
+        rule = active_sub.plan.rule
+        if rule:
+            current_time = now.time()
+            current_weekday = now.weekday()  # 0=Monday ... 6=Sunday, matches allowed_days convention
+
+            if rule.allowed_days:
+                allowed_days_list = [int(d) for d in rule.allowed_days.split(",") if d.strip() != ""]
+                if current_weekday not in allowed_days_list:
+                    await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
+                                         "Access Denied: Outside allowed days for your plan.")
+                    raise HTTPException(status_code=403, detail="Access Denied: Your plan does not allow access on this day.")
+
+            if rule.allowed_time_start and rule.allowed_time_end:
+                if not (rule.allowed_time_start <= current_time <= rule.allowed_time_end):
+                    await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
+                                         "Access Denied: Outside allowed time window for your plan.")
+                    raise HTTPException(status_code=403, detail="Access Denied: Your plan does not allow access at this time.")
 
     # 5. SUCCESS: UPDATE REDIS STATE & LOG
     new_status = "INSIDE" if action_type == "ENTRY" else "OUTSIDE"
