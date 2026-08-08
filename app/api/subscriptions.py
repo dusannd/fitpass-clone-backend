@@ -3,15 +3,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import and_
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List
 
 
 from app.core.database import get_db
 from app.models.subscription import SubscriptionPlan, UserSubscription, GymLocation, SubscriptionRule
 from app.schemas.subscription import (
-    PlanCreate, PlanResponse,
-    UserSubscriptionCreate, UserSubscriptionResponse,
+    PlanCreate, PlanUpdate, PlanResponse,
+    MySubscriptionResponse,
     GymLocationCreate, GymLocationResponse, GymLocationUpdate
 )
 from app.api.dependencies import get_current_user_id, RequireRole
@@ -39,6 +39,19 @@ async def create_location(
     await db.commit()
     await db.refresh(new_location)
     return new_location
+
+
+@router.get("/locations", response_model=List[GymLocationResponse])
+async def get_locations(
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    Admin route: list all gym locations. Used by ManagePlans.tsx to build the
+    location checkboxes when creating/editing a plan.
+    """
+    result = await db.execute(select(GymLocation))
+    return result.scalars().all()
 
 
 @router.put("/locations/{location_id}", response_model=GymLocationResponse)
@@ -91,14 +104,6 @@ async def delete_location(
 
     return None
 
-@router.get("/locations", response_model=List[GymLocationResponse])
-async def get_locations(db: AsyncSession = Depends(get_db)):
-    """
-    Public route: See all available gym locations.
-    """
-    result = await db.execute(select(GymLocation))
-    return result.scalars().all()
-
 
 # ==========================================
 # 2. SUBSCRIPTION PLANS (ADMIN ONLY)
@@ -126,23 +131,22 @@ async def create_plan(
         loc_result = await db.execute(select(GymLocation).where(GymLocation.id.in_(plan.location_ids)))
         locations = loc_result.scalars().all()
 
-
-        # --- 🛡️ BUG 3 FIX: STRICT VALIDATION ---
-        if len(locations) != len(plan.location_ids):
+        # --- STRICT VALIDATION: make sure every location_id actually exists ---
+        if len(locations) != len(set(plan.location_ids)):
             raise HTTPException(
                 status_code=400,
                 detail="One or more location_ids provided do not exist."
             )
-        # --- END FIX ---
 
-        new_plan.locations.extend(locations)
+        for loc in locations:
+            new_plan.locations.append(loc)
 
-
-    # 3. Create rules if provided (One-to-One)
+    # 3. Save the plan first so it gets an ID (the rule below needs it)
     db.add(new_plan)
-    await db.commit()  # Commit so new_plan gets an ID
+    await db.commit()
     await db.refresh(new_plan)
 
+    # 4. Create the rule if provided (One-to-One)
     if plan.rule:
         new_rule = SubscriptionRule(
             plan_id=new_plan.id,
@@ -153,7 +157,7 @@ async def create_plan(
         db.add(new_rule)
         await db.commit()
 
-    # 4. Fetch the fully loaded plan to return to the client
+    # 5. Fetch the fully loaded plan to return to the client
     stmt = select(SubscriptionPlan).options(
         selectinload(SubscriptionPlan.locations),
         selectinload(SubscriptionPlan.rule)
@@ -163,7 +167,22 @@ async def create_plan(
     return final_result.scalars().first()
 
 
-from app.schemas.subscription import PlanUpdate  # Ne zaboravi da importuješ PlanUpdate na vrhu!
+@router.get("/plans/all", response_model=List[PlanResponse])
+async def get_all_plans(
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    Admin route: list EVERY plan, active or archived.
+    (GET /plans below only returns active ones, so without this the admin
+    panel would lose sight of a plan the moment it gets deactivated.)
+    """
+    stmt = select(SubscriptionPlan).options(
+        selectinload(SubscriptionPlan.locations),
+        selectinload(SubscriptionPlan.rule)
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @router.put("/plans/{plan_id}", response_model=PlanResponse)
@@ -174,8 +193,8 @@ async def update_plan(
         admin_id: int = Depends(get_current_admin)
 ):
     """
-    Admin updates an existing subscription plan.
-    Only provided fields will be updated.
+    Admin updates an existing subscription plan's basic fields.
+    Only provided fields will be updated. (Locations/rule are managed separately.)
     """
     # 1. Find the plan in the database
     stmt = select(SubscriptionPlan).options(
@@ -200,6 +219,36 @@ async def update_plan(
     await db.refresh(plan_to_update)
 
     return plan_to_update
+
+
+@router.put("/plans/{plan_id}/toggle-active", response_model=PlanResponse)
+async def toggle_plan_active(
+        plan_id: int,
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    Admin soft-deletes/restores a plan by flipping is_active.
+    Deactivated plans disappear from GET /plans, but members who already
+    bought them keep access until their subscription naturally expires.
+    """
+    stmt = select(SubscriptionPlan).options(
+        selectinload(SubscriptionPlan.locations),
+        selectinload(SubscriptionPlan.rule)
+    ).where(SubscriptionPlan.id == plan_id)
+
+    result = await db.execute(stmt)
+    plan_to_toggle = result.scalars().first()
+
+    if not plan_to_toggle:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan_to_toggle.is_active = not plan_to_toggle.is_active
+    db.add(plan_to_toggle)
+    await db.commit()
+    await db.refresh(plan_to_toggle)
+
+    return plan_to_toggle
 
 
 @router.delete("/plans/{plan_id}")
@@ -242,7 +291,7 @@ async def delete_plan(
 
 
 # ==========================================
-# PUBLIC ROUTES (USER FRONTEND)
+# PUBLIC / MEMBER ROUTES
 # ==========================================
 
 @router.get("/plans", response_model=List[PlanResponse])
@@ -250,6 +299,8 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
     """
     Public route: Get all ACTIVE plans.
     Archived (Soft Deleted) plans are hidden from the frontend.
+    Locations + rule are eagerly loaded so the pricing cards can render
+    everything in one request.
     """
     stmt = (
         select(SubscriptionPlan)
@@ -262,61 +313,38 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     return result.scalars().all()
 
-"""
 
-# ==========================================
-# 3. USER SUBSCRIPTIONS (LOGGED IN USERS)
-# ==========================================
-@router.post("/subscribe", response_model=UserSubscriptionResponse)
-async def subscribe_user(
-        subscription: UserSubscriptionCreate,
+@router.get("/my-subscription", response_model=MySubscriptionResponse)
+async def get_my_subscription(
         db: AsyncSession = Depends(get_db),
         current_user_id: int = Depends(get_current_user_id)
 ):
-   
-      # User buys a plan. Prevents buying if an active subscription already exists.
-    
-    # --- NEW: PREVENT DOUBLE SUBSCRIPTIONS ---
-    # Check if the user already has an active subscription
+    """
+    Member route: returns the caller's currently active subscription
+    (is_active == 1 and not yet expired), with its plan, rule and
+    locations eagerly loaded.
+    """
     now = datetime.now(timezone.utc)
-    active_sub_check = await db.execute(
-        select(UserSubscription).where(
+
+    stmt = (
+        select(UserSubscription)
+        .options(
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.locations),
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.rule),
+        )
+        .where(
             and_(
                 UserSubscription.user_id == current_user_id,
                 UserSubscription.is_active == 1,
                 UserSubscription.end_date > now
             )
         )
+        .order_by(UserSubscription.end_date.desc())
     )
-    if active_sub_check.scalars().first():
-        raise HTTPException(
-            status_code=400,
-            detail="You already have an active subscription. Wait for it to expire."
-        )
-    # --- END NEW VALIDATION ---
+    result = await db.execute(stmt)
+    active_sub = result.scalars().first()
 
-    # 1. Check if the requested plan exists
-    result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == subscription.plan_id))
-    plan = result.scalars().first()
+    if not active_sub:
+        raise HTTPException(status_code=404, detail="No active subscription found.")
 
-    if not plan:
-        raise HTTPException(status_code=404, detail="Plan not found")
-
-    start_date = datetime.now(timezone.utc)
-    end_date = start_date + timedelta(days=plan.duration_days)
-
-    new_sub = UserSubscription(
-        user_id=current_user_id,
-        plan_id=plan.id,
-        start_date=start_date,
-        end_date=end_date,
-        is_active=1
-    )
-
-    db.add(new_sub)
-    await db.commit()
-    await db.refresh(new_sub)
-
-    return new_sub
-
-"""
+    return active_sub
