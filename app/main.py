@@ -1,16 +1,20 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.core.rate_limit import limiter
+from app.core.config import settings
 
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
 from app.core.redis_client import check_redis_connection, close_redis_connection
 from app.services.scheduler import start_scheduler
+from app.services.storage import STATIC_DIR, AVATAR_DIR
 
 # --- 2. MODEL IMPORTS (Needed for SQLAlchemy to create tables) ---
+from app.models.user import User, Role, UserProfile
 from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.access import EntryLog
 from app.models.workout import WorkoutPlan, Exercise
@@ -37,17 +41,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="FitPass Clone / Gym API",
     description="Backend API for gym management and QR access",
-    version="4.0.0-dev",
+    version="4.1.0",
     lifespan=lifespan
 )
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # React Frontend (Vite)
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins = settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,6 +56,12 @@ app.add_middleware(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- STATIC FILES (Profile pictures) ---
+# Mounted under /api on purpose: the Vite dev server runs on HTTPS and already
+# proxies /api to us, so avatars load without CORS or mixed content warnings.
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/api/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # --- ROUTER REGISTRATION (This order determines the layout in Swagger UI) ---
 app.include_router(users.router, prefix="/api/users", tags=["Users"])

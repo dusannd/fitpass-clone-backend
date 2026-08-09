@@ -31,7 +31,8 @@ async def get_all_trainers(
         .join(User.roles)
         .options(
             selectinload(User.roles),
-            selectinload(User.subscriptions)  # <--- FIX: Eagerly load subscriptions to satisfy Pydantic
+            selectinload(User.subscriptions),  # <--- FIX: Eagerly load subscriptions to satisfy Pydantic
+            selectinload(User.profile)  # NEW: bio + specialties for the marketplace cards
         )
         .where(Role.name == "trainer")
     )
@@ -183,7 +184,8 @@ async def log_workout_session(
 
 @router.get("/history", response_model=List[WorkoutSessionResponse])
 async def get_workout_history(
-        limit: int = 20,
+        skip: int = 0,
+        limit: int = 10,
         db: AsyncSession = Depends(get_db),
         member_id: int = Depends(get_current_member)
 ):
@@ -198,6 +200,7 @@ async def get_workout_history(
         )
         .where(WorkoutSession.user_id == member_id)
         .order_by(WorkoutSession.date.desc())
+        .offset(skip)
         .limit(limit)
     )
     result = await db.execute(stmt)

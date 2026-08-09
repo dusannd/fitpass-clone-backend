@@ -2,7 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import or_, and_
 from typing import List
+from datetime import datetime, timezone
+
 
 from app.core.database import get_db
 from app.api.dependencies import RequireRole
@@ -71,8 +74,9 @@ async def get_pending_requests(
     stmt = (
         select(TrainerClientLink)
         .options(
-            selectinload(TrainerClientLink.client),
-            selectinload(TrainerClientLink.trainer)  # <--- FIX: Eager load trainer too
+            # NEW: chained load so we also get the client's bio/goals in one go
+            selectinload(TrainerClientLink.client).selectinload(User.profile),
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile)  # <--- FIX: Eager load trainer too
         )
         .where(
             TrainerClientLink.trainer_id == trainer_id,
@@ -124,8 +128,9 @@ async def get_my_clients(
     stmt = (
         select(TrainerClientLink)
         .options(
-            selectinload(TrainerClientLink.client),
-            selectinload(TrainerClientLink.trainer)  # <--- FIX: Eager load trainer too
+            # NEW: chained load so the client cards can show bio/goals
+            selectinload(TrainerClientLink.client).selectinload(User.profile),
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile)  # <--- FIX: Eager load trainer too
         )
         .where(
             TrainerClientLink.trainer_id == trainer_id,
@@ -142,33 +147,61 @@ async def get_my_clients(
 
 @router.post("/appointments", response_model=AppointmentResponse)
 async def schedule_appointment(
-    payload: AppointmentCreate,
-    db: AsyncSession = Depends(get_db),
-    client_id: int = Depends(get_current_member)
+        payload: AppointmentCreate,
+        db: AsyncSession = Depends(get_db),
+        client_id: int = Depends(get_current_member)
 ):
     """
-    Member Route: Schedule a 1-on-1 session with a trainer.
+    Member Route: Schedule a 1-on-1 session with a trainer (with strict validation).
     """
-    # 1. Ensure the member is actually an accepted client of this trainer
-    stmt = select(TrainerClientLink).where(
+    now = datetime.now(timezone.utc)
+
+    # 1. Cannot schedule in the past
+    if payload.start_time < now:
+        raise HTTPException(status_code=400, detail="Cannot schedule an appointment in the past.")
+
+    # 2. End time must be strictly after start time
+    if payload.end_time <= payload.start_time:
+        raise HTTPException(status_code=400, detail="End time must be after start time.")
+
+    # 3. Session duration limit (Max 3 hours / 180 minutes)
+    duration = payload.end_time - payload.start_time
+    if duration.total_seconds() > (3 * 3600):
+        raise HTTPException(status_code=400, detail="A single session cannot exceed 3 hours.")
+
+    # 4. Security Check: Ensure the client is officially assigned to this trainer
+    stmt_link = select(TrainerClientLink).where(
         TrainerClientLink.client_id == client_id,
         TrainerClientLink.trainer_id == payload.trainer_id,
         TrainerClientLink.status == "ACCEPTED"
     )
-    result = await db.execute(stmt)
-    link = result.scalars().first()
+    result_link = await db.execute(stmt_link)
+    link = result_link.scalars().first()
 
     if not link:
         raise HTTPException(
             status_code=403,
-            detail="You can only schedule appointments with trainers who have accepted your coaching request."
+            detail="You can only schedule appointments with trainers who have accepted your request."
         )
 
-    # 2. Basic time validation (End time must be after start time)
-    if payload.end_time <= payload.start_time:
-        raise HTTPException(status_code=400, detail="End time must be after start time.")
+    # 5. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
+    # Overlap logic: (NewStart < ExistingEnd) AND (NewEnd > ExistingStart)
+    stmt_overlap = select(Appointment).where(
+        Appointment.trainer_id == payload.trainer_id,
+        Appointment.status == "SCHEDULED",
+        and_(
+            payload.start_time < Appointment.end_time,
+            payload.end_time > Appointment.start_time
+        )
+    )
+    overlap_result = await db.execute(stmt_overlap)
+    if overlap_result.scalars().first():
+        raise HTTPException(
+            status_code=409,  # 409 Conflict
+            detail="The trainer already has another session booked at this time."
+        )
 
-    # 3. Create the appointment
+    # 6. Create the appointment
     new_appointment = Appointment(
         trainer_id=payload.trainer_id,
         client_id=client_id,
@@ -179,10 +212,13 @@ async def schedule_appointment(
     db.add(new_appointment)
     await db.commit()
 
-    # 4. Reload to eager-load relationships for the response
+    # 7. Reload with relationships eager-loaded for the Pydantic response
     stmt_reload = (
         select(Appointment)
-        .options(selectinload(Appointment.trainer), selectinload(Appointment.client))
+        .options(
+            selectinload(Appointment.trainer).selectinload(User.profile),
+            selectinload(Appointment.client).selectinload(User.profile)
+        )
         .where(Appointment.id == new_appointment.id)
     )
     res_reload = await db.execute(stmt_reload)
@@ -199,7 +235,10 @@ async def get_trainer_appointments(
     """
     stmt = (
         select(Appointment)
-        .options(selectinload(Appointment.client), selectinload(Appointment.trainer))
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
         .where(Appointment.trainer_id == trainer_id)
         .order_by(Appointment.start_time.asc())
     )
@@ -222,7 +261,10 @@ async def update_appointment_status(
 
     stmt = (
         select(Appointment)
-        .options(selectinload(Appointment.client), selectinload(Appointment.trainer))
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
         .where(
             Appointment.id == appointment_id,
             Appointment.trainer_id == trainer_id
@@ -241,3 +283,45 @@ async def update_appointment_status(
     await db.commit()
 
     return appointment
+
+
+@router.get("/my-trainers", response_model=List[TrainerClientLinkResponse])
+async def get_my_trainers(
+        db: AsyncSession = Depends(get_db),
+        client_id: int = Depends(get_current_member)
+):
+    """
+    Member Route: View all trainers I have requested or am coached by.
+    """
+    stmt = (
+        select(TrainerClientLink)
+        .options(
+            # NEW: chained load so we also pull the trainer's profile (bio/goals)
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile),
+            selectinload(TrainerClientLink.client).selectinload(User.profile) # <-- OVO NAM JE FALILO! Pydantic je pokušavao da učita ovo naknadno i pucao.
+        )
+        .where(TrainerClientLink.client_id == client_id)
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/appointments/client", response_model=List[AppointmentResponse])
+async def get_client_appointments(
+    db: AsyncSession = Depends(get_db),
+    client_id: int = Depends(get_current_member)
+):
+    """
+    Member Route: View all my scheduled and past appointments.
+    """
+    stmt = (
+        select(Appointment)
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
+        .where(Appointment.client_id == client_id)
+        .order_by(Appointment.start_time.asc())
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()

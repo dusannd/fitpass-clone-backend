@@ -1,6 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional
+
+from app.schemas.user import UserProfileResponse
 
 class CoachingUser(BaseModel):
     """
@@ -12,6 +14,9 @@ class CoachingUser(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     email: str
+
+    # NEW: Trainers need the client's bio/goals to decide before hitting Accept
+    profile: Optional[UserProfileResponse] = None
 
     class Config:
         from_attributes = True
@@ -77,5 +82,4 @@ class AppointmentResponse(BaseModel):
     trainer: Optional[CoachingUser] = None
     client: Optional[CoachingUser] = None
 
-    class Config:
-        from_attributes = True
+model_config = ConfigDict(from_attributes=True)

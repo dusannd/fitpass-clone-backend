@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import (APIRouter, Depends, HTTPException, status, Request, BackgroundTasks,
+Query, Response, UploadFile, File)
+from fastapi.responses import JSONResponse
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -8,14 +10,18 @@ import jwt
 
 from app.core.rate_limit import limiter
 # We now import the Role model as well
-from app.models.user import User, Role
+from app.models.user import User, Role, UserProfile
 from app.core.database import get_db
 from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
-PasswordResetRequest, PasswordResetConfirm)
+PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest,
+UserProfileUpdate, UserProfileResponse)
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.config import settings
 from app.api.dependencies import RequireRole
 from app.services.email import create_action_token, send_verification_email, send_password_reset_email
+from app.services.recaptcha import verify_recaptcha
+from app.services.storage import save_avatar, delete_avatar
+
 
 router = APIRouter()
 
@@ -24,7 +30,21 @@ get_current_admin = RequireRole("admin")
 
 
 @router.post("/", response_model=UserResponse)
-async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
+async def create_user(
+    user: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    # 0. SECURITY: Honeypot Check (Bot trap)
+    if user.extra_info:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
+        )
+
+    # ---> NEW: 0.5 SECURITY: reCAPTCHA Verification <---
+    await verify_recaptcha(user.recaptcha_token)
+
     # 1. Check if user with this email already exists
     result = await db.execute(select(User).where(User.email == user.email))
     existing_user = result.scalars().first()
@@ -40,12 +60,10 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         password_hash=hashed_password,
         first_name=user.first_name,
         last_name=user.last_name,
-        # SECURE FIX: Auto-verify only if we are actively running Pytest!
         is_verified=True if (user.email.endswith("@test.com") and getattr(settings, "TESTING", False)) else False
     )
 
     # 4. ASSIGN DEFAULT ROLE
-    # Ensure the 'member' role exists in the database. If not, create it dynamically.
     role_result = await db.execute(select(Role).where(Role.name == "member"))
     default_role = role_result.scalars().first()
 
@@ -55,56 +73,85 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         await db.commit()
         await db.refresh(default_role)
 
-    # Add the role to the user's list of roles
-    # (SQLAlchemy automatically handles the user_roles Many-to-Many association table)
     new_user.roles.append(default_role)
 
-    # 5. Save to database
+    # 5. NEW: Attach the optional profile (bio / fitness goals) from the form.
+    # The cascade on User.profile inserts this in the same transaction as the user.
+    if user.profile:
+        new_user.profile = UserProfile(
+            bio=user.profile.bio,
+            fitness_goals=user.profile.fitness_goals,
+        )
+
+    # 6. Save to database
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
 
-    # FIX for async sqlalchemy (MissingGreenlet Error):
-    # We must explicitly reload the user with all necessary relationships (roles, subscriptions)
-    # before returning it to Pydantic for serialization.
     stmt = (
         select(User)
-        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions),
+            selectinload(User.profile)
+        )
         .where(User.id == new_user.id)
     )
     result = await db.execute(stmt)
     created_user = result.scalars().first()
 
+    # 7. SEND EMAIL IN THE BACKGROUND
     verification_token = create_action_token(created_user.email, "verify_email")
-    await send_verification_email(created_user.email, verification_token)
+
+    # <--- 2. USE BACKGROUND_TASKS.ADD_TASK INSTEAD OF AWAIT --->
+    # The server will return the response immediately and run this function in the background.
+    background_tasks.add_task(send_verification_email, created_user.email, verification_token)
 
     return created_user
 
-
 @router.get("/", response_model=list[UserResponse])
 async def get_all_users(
+    skip: int = Query(0, ge=0, description="Pagination offset"),
+    limit: int = Query(50, ge=1, le=100, description="Max 100 records per page"),
     db: AsyncSession = Depends(get_db),
-    admin_id: int = Depends(get_current_admin) # <--- ZAKLJUČANO ZA ADMINA
+    admin_id: int = Depends(get_current_admin)
 ):
     """
-    Admin Dashboard route: Fetch all users along with their roles and subscriptions.
+    Admin Dashboard route: Fetch paginated users along with their roles and subscriptions.
     """
-    # Fetch users, and join their roles AND their subscriptions in one fast query
-    stmt = select(User).options(
-        selectinload(User.roles),
-        selectinload(User.subscriptions) # Puni listu pretplata za front-end
+    # Fetch users, applying limit and offset for pagination
+    stmt = (
+        select(User)
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions),
+            selectinload(User.profile)  # NEW: eager load so we don't fire N+1 queries
+        )
+        .offset(skip)
+        .limit(limit)
     )
     result = await db.execute(stmt)
     users = result.scalars().all()
     return users
 
-@router.post("/login", response_model=Token)
+@router.post("/login")
 @limiter.limit("5/minute")
 async def login(
     request: Request,
+    response: Response,
     user_credentials: UserLogin,
     db: AsyncSession = Depends(get_db)
 ):
+
+    # 0. SECURITY: Honeypot Check (Bot trap)
+    if user_credentials.extra_info:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"code": "HONEYPOT_TRIGGERED", "message": "Invalid request."}
+        )
+
+    # ---> NEW: 0.5 SECURITY: reCAPTCHA Verification <---
+    await verify_recaptcha(user_credentials.recaptcha_token)
 
     # 1. Fetch user from the database by email
     result = await db.execute(select(User).where(User.email == user_credentials.email))
@@ -125,15 +172,28 @@ async def login(
         )
 
     # 3. EXTRACT ROLES
-    # Extract just the role names into a flat list, e.g., ["member", "admin"]
+    # Extract roles
     role_names = [role.name for role in user.roles]
 
-    # 4. Generate the JWT access token (packing the list of roles into the token)
+    # Generate the JWT access token
     access_token = create_access_token(data={"sub": str(user.id), "roles": role_names})
 
-    # 5. Return the token to the client
-    return {"access_token": access_token, "token_type": "bearer"}
+    # --- NEW: SET HTTP-ONLY COOKIE ---
+    # We calculate the max_age in seconds
+    max_age_seconds = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
 
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,  # Prevents XSS attacks (JS cannot read it)
+        secure=not settings.TESTING,  # True in production (HTTPS required)
+        samesite="lax",  # CSRF protection
+        max_age=max_age_seconds,
+        expires=max_age_seconds,
+    )
+
+    # We no longer need to return the token in the JSON body
+    return {"message": "Successfully logged in"}
 
 get_current_admin = RequireRole("admin")
 
@@ -148,7 +208,11 @@ async def get_my_profile(
     """
     stmt = (
         select(User)
-        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions),
+            selectinload(User.profile)  # NEW
+        )
         .where(User.id == current_user_id)
     )
     result = await db.execute(stmt)
@@ -158,6 +222,109 @@ async def get_my_profile(
         raise HTTPException(status_code=404, detail="User not found")
 
     return user
+
+
+async def get_or_create_profile(db: AsyncSession, user_id: int) -> UserProfile:
+    """
+    Helper: loads the user together with their profile in one round trip.
+    Accounts made before profiles existed don't have a row yet, so we build one
+    instead of throwing a 404 at them.
+    """
+    stmt = (
+        select(User)
+        .options(selectinload(User.profile))
+        .where(User.id == user_id)
+    )
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.profile is None:
+        user.profile = UserProfile(user_id=user.id)
+
+    return user.profile
+
+
+@router.put("/me/profile", response_model=UserProfileResponse)
+async def update_my_profile(
+        payload: UserProfileUpdate,
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user updates their own profile text (bio + fitness goals).
+    The profile picture has its own endpoint below.
+    """
+    # 1. Grab the profile (created on the fly for older accounts)
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # 2. Only touch the keys the client actually sent (partial update).
+    # exclude_unset keeps "field not sent" different from "field sent as null".
+    changes = payload.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        # Empty textareas come back as "" from the frontend, store them as NULL
+        if isinstance(value, str):
+            value = value.strip() or None
+        setattr(profile, field, value)
+
+    # 3. Save
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
+
+
+@router.post("/me/avatar", response_model=UserProfileResponse)
+@limiter.limit("10/hour")
+async def upload_my_avatar(
+        request: Request,  # <--- Required by slowapi for rate limiting (tracks IP)
+        file: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user uploads a new profile picture.
+    Rate limited, since image processing is the most expensive thing we do here.
+    """
+    # 1. Grab the profile so we know which old file to clean up
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # 2. Validate + resize + store. This raises a clean 400/413 if the file is
+    # not a real image or is too big, and deletes the previous picture for us.
+    new_url = await save_avatar(file, old_url=profile.profile_picture_url)
+
+    # 3. Point the profile at the new file
+    profile.profile_picture_url = new_url
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
+
+
+@router.delete("/me/avatar", response_model=UserProfileResponse)
+async def delete_my_avatar(
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user removes their profile picture and falls back to the initials.
+    """
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # Wipe the file from disk first, then the reference in the DB
+    delete_avatar(profile.profile_picture_url)
+    profile.profile_picture_url = None
+
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -193,6 +360,35 @@ async def delete_user(
 # ==========================================
 # EMAIL VERIFICATION & PASSWORD RESET
 # ==========================================
+
+
+@router.post("/resend-verification")
+@limiter.limit("1/15minutes")
+async def resend_verification(
+    request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    payload: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Public Route: Allows a user to request a new email verification link.
+    Rate limited to 1 request per 15 minutes to prevent email spam.
+    """
+    # 1. Look up the user by email
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalars().first()
+
+    # 2. Security Check: We use a generic response to prevent email enumeration.
+    # We only trigger the email if the user exists AND they are NOT verified yet.
+    if user and not user.is_verified:
+        verification_token = create_action_token(user.email, "verify_email")
+        # Send the email in the background so the endpoint returns instantly
+        background_tasks.add_task(send_verification_email, user.email, verification_token)
+
+    # 3. Always return a 200 OK with the same message, regardless of whether the email exists.
+    return {
+        "message": "If this email is registered and unverified, a new verification link has been sent."
+    }
 
 @router.get("/verify-email")
 async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
@@ -280,3 +476,11 @@ async def reset_password(payload: PasswordResetConfirm, db: AsyncSession = Depen
 
 
 
+# --- NEW: ADD LOGOUT ENDPOINT ---
+@router.post("/logout")
+async def logout(response: Response):
+    """
+    Clears the httpOnly cookie to log the user out.
+    """
+    response.delete_cookie("access_token", httponly=True, samesite="lax")
+    return {"message": "Successfully logged out"}

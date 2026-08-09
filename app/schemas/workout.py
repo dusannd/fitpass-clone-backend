@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime
 
@@ -9,6 +9,7 @@ class ExerciseCreate(BaseModel):
     sets: int = 3
     reps: str
     rest_time_seconds: Optional[int] = 60
+    requires_weight: bool = True
 
 
 class ExerciseResponse(BaseModel):
@@ -17,7 +18,7 @@ class ExerciseResponse(BaseModel):
     sets: int
     reps: str
     rest_time_seconds: Optional[int]
-
+    requires_weight: bool        
     class Config:
         from_attributes = True
 
@@ -39,8 +40,7 @@ class WorkoutPlanResponse(BaseModel):
     created_at: datetime
     exercises: List[ExerciseResponse] = []
 
-    class Config:
-        from_attributes = True
+model_config = ConfigDict(from_attributes=True)
 
 
 # --- 3. WORKOUT LOGGING SCHEMAS (PROGRESS TRACKING) ---

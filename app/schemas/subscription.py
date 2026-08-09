@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime, time
 from typing import Optional, List
 
@@ -8,6 +8,7 @@ class GymLocationCreate(BaseModel):
     name: str
     address: Optional[str] = None
     is_24_7: bool = True
+
 
 class GymLocationUpdate(BaseModel):
     name: Optional[str] = None
@@ -21,8 +22,13 @@ class GymLocationResponse(BaseModel):
     address: Optional[str]
     is_24_7: bool
 
-    class Config:
-        from_attributes = True
+    # Handle legacy database rows where is_24_7 might be NULL
+    @field_validator('is_24_7', mode='before')
+    @classmethod
+    def handle_null_is_24_7(cls, v):
+        return True if v is None else v
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- 2. SUBSCRIPTION RULES ---
@@ -38,24 +44,19 @@ class RuleResponse(BaseModel):
     allowed_time_end: Optional[time]
     allowed_days: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- 3. SUBSCRIPTION PLANS ---
 class PlanCreate(BaseModel):
     name: str
     description: Optional[str] = None
-    price: float
-    duration_days: int = 30
-
-
+    price: float = Field(..., ge=0, description="Price must be 0 or greater")
+    duration_days: int = Field(default=30, gt=0, description="Duration must be at least 1 day")
     location_ids: List[int] = []
-
     rule: Optional[RuleCreate] = None
 
 
-# --- UPDATE PLAN SCHEMA ---
 class PlanUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
@@ -73,8 +74,13 @@ class PlanResponse(BaseModel):
     locations: List[GymLocationResponse] = []
     rule: Optional[RuleResponse] = None
 
-    class Config:
-        from_attributes = True
+    # Handle legacy database rows where is_active might be NULL before the migration
+    @field_validator('is_active', mode='before')
+    @classmethod
+    def handle_null_is_active(cls, v):
+        return True if v is None else v
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- 4. USER SUBSCRIPTIONS ---
@@ -90,20 +96,17 @@ class UserSubscriptionResponse(BaseModel):
     end_date: datetime
     is_active: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
-# --- 5. SUBCRIPTION RULES 2 ---
 
-class PlanCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
+# --- 5. "MY SUBSCRIPTION" (used by GET /my-subscription) ---
+class MySubscriptionResponse(BaseModel):
+    id: int
+    user_id: int
+    plan_id: int
+    start_date: datetime
+    end_date: datetime
+    is_active: int
+    plan: PlanResponse
 
-    # ge=0 means "Greater than or Equal to 0" (Price cannot be negative, but 0 is allowed for free trials)
-    price: float = Field(..., ge=0, description="Price must be 0 or greater")
-
-    # gt=0 means "Greater Than 0" (Duration must be at least 1 day)
-    duration_days: int = Field(default=30, gt=0, description="Duration must be at least 1 day")
-
-    location_ids: List[int] = []
-    rule: Optional[RuleCreate] = None
+    model_config = ConfigDict(from_attributes=True)

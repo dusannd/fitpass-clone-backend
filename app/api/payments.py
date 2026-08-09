@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from app.core.database import get_db
 from app.api.dependencies import get_current_user_id
@@ -62,6 +62,7 @@ async def create_checkout_session(
                     'price_data': {
                         'currency': 'rsd',  # Using Serbian Dinar (or 'usd', 'eur')
                         'unit_amount': int(plan.price * 100),  # Stripe requires the price in cents (para)
+                        'recurring': {'interval': 'month'},  # Assuming standard monthly billing
                         'product_data': {
                             'name': plan.name,
                             'description': plan.description or "Gym Subscription",
@@ -70,16 +71,21 @@ async def create_checkout_session(
                     'quantity': 1,
                 }
             ],
-            mode='payment',
-            # URLs where Stripe will redirect the user after payment
-            success_url="http://localhost:5173/member/dashboard?payment=success",
-            cancel_url="http://localhost:5173/member/dashboard?payment=cancelled",
+            mode='subscription',
+            # Dynamically construct redirect URLs based on the environment
+            success_url=f"{settings.FRONTEND_URL}/dashboard?payment=success",
+            cancel_url=f"{settings.FRONTEND_URL}/subscriptions?payment=cancelled",
 
-            # CRITICAL: We attach user_id and plan_id to metadata.
-            # Stripe will send this back to our webhook so we know WHO paid for WHAT.
-            metadata={
-                "user_id": user_id,
-                "plan_id": plan.id
+            # CRITICAL: For subscription mode, top-level `metadata` only lands on the
+            # Checkout Session itself. `subscription_data.metadata` is what propagates
+            # onto the actual Stripe Subscription object AND every future invoice it
+            # generates, which is what our recurring `invoice.payment_succeeded`
+            # webhook needs to identify WHO paid for WHAT on renewal.
+            subscription_data={
+                "metadata": {
+                    "user_id": user_id,
+                    "plan_id": plan.id
+                }
             }
         )
 
@@ -113,31 +119,100 @@ async def stripe_webhook(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    # 3. Handle the successful payment event
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
+    # 3. Handle recurring subscription events
+    if event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object']
 
-        # Extract the metadata we attached during checkout creation
-        user_id = int(session.metadata.user_id)
-        plan_id = int(session.metadata.plan_id)
+        # Extract the subscription's Stripe ID. Newer Stripe API versions nest this
+        # under `parent.subscription_details.subscription` instead of the legacy
+        # top-level `subscription` field, so we fall back between the two.
+        stripe_subscription_id = getattr(invoice, "subscription", None)
+        if not stripe_subscription_id:
+            parent = getattr(invoice, "parent", None)
+            nested_details = getattr(parent, "subscription_details", None) if parent else None
+            stripe_subscription_id = getattr(nested_details, "subscription", None) if nested_details else None
 
-        # Fetch the plan to calculate the expiration date
-        result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == plan_id))
-        plan = result.scalars().first()
+        # The first (and only, for our single-item checkout) invoice line item.
+        # Used both as a metadata fallback below and as the source of truth for
+        # the billing period end.
+        lines = getattr(invoice, "lines", None)
+        line_items = getattr(lines, "data", []) if lines else []
+        first_line = line_items[0] if line_items else None
 
-        if plan:
-            # Grant the subscription to the user in our database
-            start_date = datetime.now(timezone.utc)
-            end_date = start_date + timedelta(days=plan.duration_days)
+        # Extract the metadata we stamped via `subscription_data.metadata` at checkout
+        # time. It's mirrored onto `invoice.subscription_details.metadata` for every
+        # invoice (including renewals); fall back to the first line item's metadata
+        # if that field is unavailable on this API version.
+        subscription_details = getattr(invoice, "subscription_details", None)
+        metadata = getattr(subscription_details, "metadata", None) if subscription_details else None
 
-            new_sub = UserSubscription(
-                user_id=user_id,
-                plan_id=plan.id,
-                start_date=start_date,
-                end_date=end_date,
-                is_active=1
+        if not metadata and first_line:
+            metadata = first_line.get("metadata")
+
+        # IDEMPOTENCY: Stripe can (and does) redeliver the same webhook event on
+        # network retries. Incrementing end_date by a duration would double-grant
+        # days on a duplicate delivery, so instead we pull the ABSOLUTE period-end
+        # timestamp Stripe already computed for this invoice and set end_date to
+        # it directly. Replaying the same event N times converges to the same
+        # end_date instead of compounding it.
+        period = getattr(first_line, "period", None) if first_line else None
+        stripe_end_timestamp = getattr(period, "end", None) if period else None
+
+        if (
+            metadata and stripe_subscription_id and stripe_end_timestamp
+            and "user_id" in metadata and "plan_id" in metadata
+        ):
+            user_id = int(metadata["user_id"])
+            plan_id = int(metadata["plan_id"])
+            end_date = datetime.fromtimestamp(stripe_end_timestamp, timezone.utc)
+
+            # Confirm the plan still exists
+            result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == plan_id))
+            plan = result.scalars().first()
+
+            if plan:
+                existing_result = await db.execute(
+                    select(UserSubscription).where(
+                        UserSubscription.stripe_subscription_id == stripe_subscription_id
+                    )
+                )
+                existing_sub = existing_result.scalars().first()
+
+                if existing_sub:
+                    # RENEWAL (or a duplicate redelivery of the same invoice event):
+                    # overwrite end_date with Stripe's own period end rather than
+                    # incrementing it, so replays are idempotent.
+                    existing_sub.end_date = end_date
+                    existing_sub.is_active = 1
+                    db.add(existing_sub)
+                else:
+                    # FIRST PAYMENT: brand-new Stripe subscription, create our row.
+                    new_sub = UserSubscription(
+                        user_id=user_id,
+                        plan_id=plan.id,
+                        start_date=datetime.now(timezone.utc),
+                        end_date=end_date,
+                        is_active=1,
+                        stripe_subscription_id=stripe_subscription_id
+                    )
+                    db.add(new_sub)
+
+                await db.commit()
+
+    elif event['type'] == 'customer.subscription.deleted':
+        subscription = event['data']['object']
+        stripe_subscription_id = subscription.id
+
+        result = await db.execute(
+            select(UserSubscription).where(
+                UserSubscription.stripe_subscription_id == stripe_subscription_id
             )
-            db.add(new_sub)
+        )
+        user_sub = result.scalars().first()
+
+        if user_sub:
+            user_sub.is_active = 0
+            db.add(user_sub)
             await db.commit()
 
     # Always return a 200 OK so Stripe knows we received the message
