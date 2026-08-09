@@ -74,8 +74,9 @@ async def get_pending_requests(
     stmt = (
         select(TrainerClientLink)
         .options(
-            selectinload(TrainerClientLink.client),
-            selectinload(TrainerClientLink.trainer)  # <--- FIX: Eager load trainer too
+            # NEW: chained load so we also get the client's bio/goals in one go
+            selectinload(TrainerClientLink.client).selectinload(User.profile),
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile)  # <--- FIX: Eager load trainer too
         )
         .where(
             TrainerClientLink.trainer_id == trainer_id,
@@ -127,8 +128,9 @@ async def get_my_clients(
     stmt = (
         select(TrainerClientLink)
         .options(
-            selectinload(TrainerClientLink.client),
-            selectinload(TrainerClientLink.trainer)  # <--- FIX: Eager load trainer too
+            # NEW: chained load so the client cards can show bio/goals
+            selectinload(TrainerClientLink.client).selectinload(User.profile),
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile)  # <--- FIX: Eager load trainer too
         )
         .where(
             TrainerClientLink.trainer_id == trainer_id,
@@ -213,7 +215,10 @@ async def schedule_appointment(
     # 7. Reload with relationships eager-loaded for the Pydantic response
     stmt_reload = (
         select(Appointment)
-        .options(selectinload(Appointment.trainer), selectinload(Appointment.client))
+        .options(
+            selectinload(Appointment.trainer).selectinload(User.profile),
+            selectinload(Appointment.client).selectinload(User.profile)
+        )
         .where(Appointment.id == new_appointment.id)
     )
     res_reload = await db.execute(stmt_reload)
@@ -230,7 +235,10 @@ async def get_trainer_appointments(
     """
     stmt = (
         select(Appointment)
-        .options(selectinload(Appointment.client), selectinload(Appointment.trainer))
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
         .where(Appointment.trainer_id == trainer_id)
         .order_by(Appointment.start_time.asc())
     )
@@ -253,7 +261,10 @@ async def update_appointment_status(
 
     stmt = (
         select(Appointment)
-        .options(selectinload(Appointment.client), selectinload(Appointment.trainer))
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
         .where(
             Appointment.id == appointment_id,
             Appointment.trainer_id == trainer_id
@@ -285,8 +296,9 @@ async def get_my_trainers(
     stmt = (
         select(TrainerClientLink)
         .options(
-            selectinload(TrainerClientLink.trainer),
-            selectinload(TrainerClientLink.client) # <-- OVO NAM JE FALILO! Pydantic je pokušavao da učita ovo naknadno i pucao.
+            # NEW: chained load so we also pull the trainer's profile (bio/goals)
+            selectinload(TrainerClientLink.trainer).selectinload(User.profile),
+            selectinload(TrainerClientLink.client).selectinload(User.profile) # <-- OVO NAM JE FALILO! Pydantic je pokušavao da učita ovo naknadno i pucao.
         )
         .where(TrainerClientLink.client_id == client_id)
     )
@@ -304,7 +316,10 @@ async def get_client_appointments(
     """
     stmt = (
         select(Appointment)
-        .options(selectinload(Appointment.client), selectinload(Appointment.trainer))
+        .options(
+            selectinload(Appointment.client).selectinload(User.profile),
+            selectinload(Appointment.trainer).selectinload(User.profile)
+        )
         .where(Appointment.client_id == client_id)
         .order_by(Appointment.start_time.asc())
     )

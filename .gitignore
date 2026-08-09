@@ -12,3 +12,5 @@ __pycache__/
 
 # Environment varijable (Tu cemo drzati sifru baze, OVO NE SME NA GITHUB)
 .env
+# User uploaded profile pictures (these must NOT go to GitHub)
+app/static/avatars/

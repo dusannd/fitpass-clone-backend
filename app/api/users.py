@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks, Query, Response
+from fastapi import (APIRouter, Depends, HTTPException, status, Request, BackgroundTasks,
+Query, Response, UploadFile, File)
 from fastapi.responses import JSONResponse
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,15 +10,17 @@ import jwt
 
 from app.core.rate_limit import limiter
 # We now import the Role model as well
-from app.models.user import User, Role
+from app.models.user import User, Role, UserProfile
 from app.core.database import get_db
 from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
-PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest)
+PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest,
+UserProfileUpdate, UserProfileResponse)
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.config import settings
 from app.api.dependencies import RequireRole
 from app.services.email import create_action_token, send_verification_email, send_password_reset_email
 from app.services.recaptcha import verify_recaptcha
+from app.services.storage import save_avatar, delete_avatar
 
 
 router = APIRouter()
@@ -72,20 +75,32 @@ async def create_user(
 
     new_user.roles.append(default_role)
 
-    # 5. Save to database
+    # 5. NEW: Attach the optional profile (bio / fitness goals) from the form.
+    # The cascade on User.profile inserts this in the same transaction as the user.
+    if user.profile:
+        new_user.profile = UserProfile(
+            bio=user.profile.bio,
+            fitness_goals=user.profile.fitness_goals,
+        )
+
+    # 6. Save to database
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
 
     stmt = (
         select(User)
-        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions),
+            selectinload(User.profile)
+        )
         .where(User.id == new_user.id)
     )
     result = await db.execute(stmt)
     created_user = result.scalars().first()
 
-    # 6. SEND EMAIL IN THE BACKGROUND
+    # 7. SEND EMAIL IN THE BACKGROUND
     verification_token = create_action_token(created_user.email, "verify_email")
 
     # <--- 2. USE BACKGROUND_TASKS.ADD_TASK INSTEAD OF AWAIT --->
@@ -109,7 +124,8 @@ async def get_all_users(
         select(User)
         .options(
             selectinload(User.roles),
-            selectinload(User.subscriptions)
+            selectinload(User.subscriptions),
+            selectinload(User.profile)  # NEW: eager load so we don't fire N+1 queries
         )
         .offset(skip)
         .limit(limit)
@@ -192,7 +208,11 @@ async def get_my_profile(
     """
     stmt = (
         select(User)
-        .options(selectinload(User.roles), selectinload(User.subscriptions))
+        .options(
+            selectinload(User.roles),
+            selectinload(User.subscriptions),
+            selectinload(User.profile)  # NEW
+        )
         .where(User.id == current_user_id)
     )
     result = await db.execute(stmt)
@@ -202,6 +222,109 @@ async def get_my_profile(
         raise HTTPException(status_code=404, detail="User not found")
 
     return user
+
+
+async def get_or_create_profile(db: AsyncSession, user_id: int) -> UserProfile:
+    """
+    Helper: loads the user together with their profile in one round trip.
+    Accounts made before profiles existed don't have a row yet, so we build one
+    instead of throwing a 404 at them.
+    """
+    stmt = (
+        select(User)
+        .options(selectinload(User.profile))
+        .where(User.id == user_id)
+    )
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.profile is None:
+        user.profile = UserProfile(user_id=user.id)
+
+    return user.profile
+
+
+@router.put("/me/profile", response_model=UserProfileResponse)
+async def update_my_profile(
+        payload: UserProfileUpdate,
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user updates their own profile text (bio + fitness goals).
+    The profile picture has its own endpoint below.
+    """
+    # 1. Grab the profile (created on the fly for older accounts)
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # 2. Only touch the keys the client actually sent (partial update).
+    # exclude_unset keeps "field not sent" different from "field sent as null".
+    changes = payload.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        # Empty textareas come back as "" from the frontend, store them as NULL
+        if isinstance(value, str):
+            value = value.strip() or None
+        setattr(profile, field, value)
+
+    # 3. Save
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
+
+
+@router.post("/me/avatar", response_model=UserProfileResponse)
+@limiter.limit("10/hour")
+async def upload_my_avatar(
+        request: Request,  # <--- Required by slowapi for rate limiting (tracks IP)
+        file: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user uploads a new profile picture.
+    Rate limited, since image processing is the most expensive thing we do here.
+    """
+    # 1. Grab the profile so we know which old file to clean up
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # 2. Validate + resize + store. This raises a clean 400/413 if the file is
+    # not a real image or is too big, and deletes the previous picture for us.
+    new_url = await save_avatar(file, old_url=profile.profile_picture_url)
+
+    # 3. Point the profile at the new file
+    profile.profile_picture_url = new_url
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
+
+
+@router.delete("/me/avatar", response_model=UserProfileResponse)
+async def delete_my_avatar(
+        db: AsyncSession = Depends(get_db),
+        current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    Logged in user removes their profile picture and falls back to the initials.
+    """
+    profile = await get_or_create_profile(db, current_user_id)
+
+    # Wipe the file from disk first, then the reference in the DB
+    delete_avatar(profile.profile_picture_url)
+    profile.profile_picture_url = None
+
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

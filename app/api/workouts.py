@@ -31,7 +31,8 @@ async def get_all_trainers(
         .join(User.roles)
         .options(
             selectinload(User.roles),
-            selectinload(User.subscriptions)  # <--- FIX: Eagerly load subscriptions to satisfy Pydantic
+            selectinload(User.subscriptions),  # <--- FIX: Eagerly load subscriptions to satisfy Pydantic
+            selectinload(User.profile)  # NEW: bio + specialties for the marketplace cards
         )
         .where(Role.name == "trainer")
     )

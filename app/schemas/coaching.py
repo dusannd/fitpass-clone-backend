@@ -2,6 +2,8 @@ from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional
 
+from app.schemas.user import UserProfileResponse
+
 class CoachingUser(BaseModel):
     """
     A lightweight schema for representing a user (Trainer or Client)
@@ -12,6 +14,9 @@ class CoachingUser(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     email: str
+
+    # NEW: Trainers need the client's bio/goals to decide before hitting Accept
+    profile: Optional[UserProfileResponse] = None
 
     class Config:
         from_attributes = True

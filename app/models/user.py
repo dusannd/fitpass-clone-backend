@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Table
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -61,3 +61,45 @@ class User(Base):
                                lazy="selectin")
     # NEW: Historical logs of completed workout sessions by the user
     workout_sessions = relationship("WorkoutSession", back_populates="user", cascade="all, delete-orphan")
+
+    # NEW: One-to-One profile (bio, goals, avatar).
+    # Same lazy="selectin" trick as roles above, so the profile is always loaded
+    # in one extra batched query instead of N+1 (and never blows up on async).
+    profile = relationship(
+        "UserProfile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+# 4. USER PROFILE MODEL
+# Kept in its own table so login/auth queries stay light and the bio text
+# doesn't get dragged along on every single user lookup.
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # unique=True is what makes this One-to-One instead of One-to-Many
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    # Trainers sell themselves here, members describe themselves
+    bio = Column(Text, nullable=True)
+    # Comma separated ("Lose weight, Build muscle").
+    # For trainers the frontend shows this same field as "Specialties".
+    fitness_goals = Column(String, nullable=True)
+    profile_picture_url = Column(String, nullable=True)
+
+    # Audit timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="profile")
