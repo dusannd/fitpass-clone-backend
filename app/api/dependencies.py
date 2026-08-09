@@ -1,10 +1,11 @@
 from fastapi import Depends, HTTPException, Request
 import jwt
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import get_db
 from app.models.user import User
 
 
@@ -46,7 +47,11 @@ class RequireRole:
     def __init__(self, required_role: str):
         self.required_role = required_role
 
-    async def __call__(self, token: str = Depends(get_token_from_cookie)) -> int:
+    async def __call__(
+            self,
+            token: str = Depends(get_token_from_cookie),
+            db: AsyncSession = Depends(get_db)
+    ) -> int:
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             user_id = payload.get("sub")
@@ -61,20 +66,25 @@ class RequireRole:
                     detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
                 )
 
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(User).options(selectinload(User.roles)).where(User.id == int(user_id)))
-                user = result.scalars().first()
+            # Use the INJECTED session instead of opening our own.
+            # Calling AsyncSessionLocal() by hand ignores the get_db override,
+            # so during tests every role protected route would still talk to
+            # the real database instead of the test one.
+            result = await db.execute(
+                select(User).options(selectinload(User.roles)).where(User.id == int(user_id))
+            )
+            user = result.scalars().first()
 
-                if not user:
-                    raise HTTPException(status_code=401, detail="User no longer exists.")
+            if not user:
+                raise HTTPException(status_code=401, detail="User no longer exists.")
 
-                actual_roles = [role.name for role in user.roles]
+            actual_roles = [role.name for role in user.roles]
 
-                if self.required_role not in actual_roles:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Your privileges have been revoked by an administrator."
-                    )
+            if self.required_role not in actual_roles:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your privileges have been revoked by an administrator."
+                )
 
             return int(user_id)
 

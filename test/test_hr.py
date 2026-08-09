@@ -64,5 +64,7 @@ async def test_hr_hiring_and_firing_flow():
             assert res_fire_member.status_code == 400
 
         finally:
-            # CRITICAL: Always clear overrides so they don't break other tests!
-            app.dependency_overrides.clear()
+            # CRITICAL: Drop ONLY the admin override! clear() would also wipe the
+            # get_db override from conftest, and then every test after this one
+            # would write into the REAL database instead of the test one.
+            app.dependency_overrides.pop(get_current_admin, None)

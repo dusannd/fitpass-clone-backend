@@ -38,17 +38,17 @@ async def test_appointment_scheduling_flow():
             app.dependency_overrides[get_current_admin] = override_get_current_admin
             await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
         finally:
-            app.dependency_overrides.clear()
+            app.dependency_overrides.pop(get_current_admin, None)
 
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
-        trainer_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # Client
         res = await ac.post("/api/users/",
                             json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
         client_id = res.json()["id"]
         res = await ac.post("/api/users/login", json={"email": client_email, "password": password})
-        client_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # --- 2. LINK TRAINER AND CLIENT ---
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)

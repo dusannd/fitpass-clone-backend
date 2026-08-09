@@ -38,17 +38,17 @@ async def test_private_workout_plans_security_and_visibility():
             app.dependency_overrides[get_current_admin] = override_get_current_admin
             await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
         finally:
-            app.dependency_overrides.clear()
+            app.dependency_overrides.pop(get_current_admin, None)
 
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
-        trainer_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # Create Client A
         res = await ac.post("/api/users/",
                             json={"email": client_a_email, "password": password, "first_name": "A", "last_name": "A"})
         client_a_id = res.json()["id"]
         res = await ac.post("/api/users/login", json={"email": client_a_email, "password": password})
-        client_a_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        client_a_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # Create Client B (Will remain unaffiliated with the trainer)
         res = await ac.post("/api/users/",

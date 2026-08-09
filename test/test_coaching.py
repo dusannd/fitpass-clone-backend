@@ -41,11 +41,11 @@ async def test_coaching_request_flow():
             app.dependency_overrides[get_current_admin] = override_get_current_admin
             await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
         finally:
-            app.dependency_overrides.clear()
+            app.dependency_overrides.pop(get_current_admin, None)
             # Login Trainer to get their JWT Token
         res_trainer_login = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
-        trainer_token = res_trainer_login.json()["access_token"]
-        trainer_headers = {"Authorization": f"Bearer {trainer_token}"}
+        trainer_token = res_trainer_login.cookies["access_token"]
+        trainer_headers = {"Cookie": f"access_token={trainer_token}"}
 
         # --- SETUP: CREATE MEMBER ---
         res_member_reg = await ac.post("/api/users/", json={
@@ -56,8 +56,8 @@ async def test_coaching_request_flow():
 
         # Login Member to get their JWT Token
         res_member_login = await ac.post("/api/users/login", json={"email": member_email, "password": password})
-        member_token = res_member_login.json()["access_token"]
-        member_headers = {"Authorization": f"Bearer {member_token}"}
+        member_token = res_member_login.cookies["access_token"]
+        member_headers = {"Cookie": f"access_token={member_token}"}
 
         # --- STEP 1: MEMBER SENDS COACHING REQUEST ---
         res_request = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)

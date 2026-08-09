@@ -37,16 +37,16 @@ async def test_workout_logging_flow():
             app.dependency_overrides[get_current_admin] = override_get_current_admin
             await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
         finally:
-            app.dependency_overrides.clear()
+            app.dependency_overrides.pop(get_current_admin, None)
 
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
-        trainer_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # Member
         await ac.post("/api/users/",
                       json={"email": member_email, "password": password, "first_name": "M", "last_name": "M"})
         res = await ac.post("/api/users/login", json={"email": member_email, "password": password})
-        member_headers = {"Authorization": f"Bearer {res.json()['access_token']}"}
+        member_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # --- 2. TRAINER CREATES A PLAN ---
         plan_payload = {
