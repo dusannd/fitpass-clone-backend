@@ -11,6 +11,16 @@ user_saved_plans = Table(
     Column("plan_id", Integer, ForeignKey("workout_plans.id", ondelete="CASCADE"), primary_key=True),
 )
 
+# A member can hide a plan their trainer assigned to them once they are done with it.
+# We record the dismissal instead of deleting the plan: the plan belongs to the trainer,
+# who keeps their copy either way, and hiding stays reversible for the member.
+user_dismissed_plans = Table(
+    "user_dismissed_plans",
+    Base.metadata,
+    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("plan_id", Integer, ForeignKey("workout_plans.id", ondelete="CASCADE"), primary_key=True),
+)
+
 
 class WorkoutPlan(Base):
     """
