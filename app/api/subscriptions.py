@@ -123,7 +123,8 @@ async def create_plan(
         name=plan.name,
         description=plan.description,
         price=plan.price,
-        duration_days=plan.duration_days
+        duration_days=plan.duration_days,
+        tier=plan.tier
     )
 
     # 2. Assign allowed locations (Many-to-Many)

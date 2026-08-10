@@ -4,7 +4,7 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import or_, and_
 from typing import List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 from app.core.database import get_db
@@ -19,6 +19,25 @@ router = APIRouter()
 
 get_current_member = RequireRole("member")
 get_current_trainer = RequireRole("trainer")
+
+# How far ahead a member is allowed to book. Keeps a trainer's calendar plannable
+# and stops somebody parking a slot years out.
+MAX_BOOKING_HORIZON_DAYS = 60
+
+
+def as_utc(value: datetime) -> datetime:
+    """
+    Force a datetime to be timezone-aware (assuming UTC when it is not).
+
+    Needed in two places:
+      - Incoming payloads: 'start_time' is a bare datetime, so Pydantic happily
+        accepts a naive string like "2026-09-01T10:00:00". Comparing that to an
+        aware now() raises TypeError, which would surface as a 500.
+      - Rows read back out: the columns are DateTime(timezone=True), which returns
+        aware values on Postgres but NAIVE ones on SQLite - and the test suite runs
+        on SQLite.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 @router.post("/request/{trainer_id}")
@@ -196,20 +215,32 @@ async def schedule_appointment(
     """
     now = datetime.now(timezone.utc)
 
+    # Normalise first, so a client that sends a naive timestamp gets a proper 400
+    # from the checks below instead of a 500 out of the comparison itself.
+    start_time = as_utc(payload.start_time)
+    end_time = as_utc(payload.end_time)
+
     # 1. Cannot schedule in the past
-    if payload.start_time < now:
+    if start_time < now:
         raise HTTPException(status_code=400, detail="Cannot schedule an appointment in the past.")
 
-    # 2. End time must be strictly after start time
-    if payload.end_time <= payload.start_time:
+    # 2. Cannot schedule beyond the booking horizon
+    if start_time > now + timedelta(days=MAX_BOOKING_HORIZON_DAYS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Appointments can only be booked up to {MAX_BOOKING_HORIZON_DAYS} days in advance."
+        )
+
+    # 3. End time must be strictly after start time
+    if end_time <= start_time:
         raise HTTPException(status_code=400, detail="End time must be after start time.")
 
-    # 3. Session duration limit (Max 3 hours / 180 minutes)
-    duration = payload.end_time - payload.start_time
+    # 4. Session duration limit (Max 3 hours / 180 minutes)
+    duration = end_time - start_time
     if duration.total_seconds() > (3 * 3600):
         raise HTTPException(status_code=400, detail="A single session cannot exceed 3 hours.")
 
-    # 4. Security Check: Ensure the client is officially assigned to this trainer
+    # 5. Security Check: Ensure the client is officially assigned to this trainer
     stmt_link = select(TrainerClientLink).where(
         TrainerClientLink.client_id == client_id,
         TrainerClientLink.trainer_id == payload.trainer_id,
@@ -224,14 +255,14 @@ async def schedule_appointment(
             detail="You can only schedule appointments with trainers who have accepted your request."
         )
 
-    # 5. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
+    # 6. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
     # Overlap logic: (NewStart < ExistingEnd) AND (NewEnd > ExistingStart)
     stmt_overlap = select(Appointment).where(
         Appointment.trainer_id == payload.trainer_id,
         Appointment.status == "SCHEDULED",
         and_(
-            payload.start_time < Appointment.end_time,
-            payload.end_time > Appointment.start_time
+            start_time < Appointment.end_time,
+            end_time > Appointment.start_time
         )
     )
     overlap_result = await db.execute(stmt_overlap)
@@ -241,18 +272,18 @@ async def schedule_appointment(
             detail="The trainer already has another session booked at this time."
         )
 
-    # 6. Create the appointment
+    # 7. Create the appointment (storing the normalised, timezone-aware values)
     new_appointment = Appointment(
         trainer_id=payload.trainer_id,
         client_id=client_id,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
+        start_time=start_time,
+        end_time=end_time,
         status="SCHEDULED"
     )
     db.add(new_appointment)
     await db.commit()
 
-    # 7. Reload with relationships eager-loaded for the Pydantic response
+    # 8. Reload with relationships eager-loaded for the Pydantic response
     stmt_reload = (
         select(Appointment)
         .options(
@@ -295,6 +326,9 @@ async def update_appointment_status(
 ):
     """
     Trainer Route: Complete or cancel an appointment and optionally add notes.
+
+    Notes follow partial-update semantics: omit the key to leave existing feedback
+    alone, send text to replace it, send an explicit null to clear it.
     """
     if payload.status not in ["COMPLETED", "CANCELLED"]:
         raise HTTPException(status_code=400, detail="Status must be COMPLETED or CANCELLED.")
@@ -316,8 +350,26 @@ async def update_appointment_status(
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found.")
 
+    # A session can only be closed out once it has actually begun. We gate on
+    # start_time rather than end_time so a trainer who wraps up early doesn't have
+    # to sit and wait for the clock.
+    # CANCELLED is deliberately NOT gated - cancelling a future session is the
+    # entire point of cancelling.
+    if payload.status == "COMPLETED" and datetime.now(timezone.utc) < as_utc(appointment.start_time):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot complete a session that hasn't happened yet."
+        )
+
     appointment.status = payload.status
-    appointment.notes = payload.notes
+
+    # 'notes' used to be assigned unconditionally, so a plain status change with no
+    # notes attached silently erased whatever feedback was already there - and that
+    # text is shown to the member as "Trainer's Note". exclude_unset lets us tell
+    # "not sent" (leave it) apart from an explicit null (a deliberate erase).
+    update_data = payload.model_dump(exclude_unset=True)
+    if "notes" in update_data:
+        appointment.notes = update_data["notes"]
 
     db.add(appointment)
     await db.commit()

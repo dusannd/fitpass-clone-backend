@@ -1,6 +1,12 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime, time
-from typing import Optional, List
+from typing import Optional, List, Literal
+
+
+# --- 0. PLAN TIERS ---
+# The visual/marketing tier of a plan. A Literal gives us a 422 on a bad value for
+# free, so no custom validator is needed on the way in.
+PlanTier = Literal["Standard", "Pro", "VIP"]
 
 
 # --- 1. GYM LOCATIONS ---
@@ -53,15 +59,47 @@ class PlanCreate(BaseModel):
     description: Optional[str] = None
     price: float = Field(..., ge=0, description="Price must be 0 or greater")
     duration_days: int = Field(default=30, gt=0, description="Duration must be at least 1 day")
+    tier: PlanTier = "Standard"
     location_ids: List[int] = []
     rule: Optional[RuleCreate] = None
 
 
 class PlanUpdate(BaseModel):
+    # Every field is optional because this is a partial update: an omitted key means
+    # "leave this alone". None as the default is only a marker for "not supplied" -
+    # see the validator below for why an *explicitly* sent null is a different thing.
     name: Optional[str] = None
     description: Optional[str] = None
     price: Optional[float] = Field(None, ge=0, description="Price must be 0 or greater")
     duration_days: Optional[int] = Field(None, gt=0, description="Duration must be at least 1 day")
+    tier: Optional[PlanTier] = None
+
+    @field_validator("name", "price", "duration_days", "tier")
+    @classmethod
+    def reject_explicit_null(cls, v):
+        """
+        Refuse an explicitly sent null on the fields that cannot hold one.
+
+        name, price and tier are NOT NULL columns, so a null would travel through
+        model_dump(exclude_unset=True) into setattr and blow up as an unhandled
+        IntegrityError - a 500 for what is really a bad request.
+
+        duration_days is worse: its column IS nullable, so the write succeeds, but
+        PlanResponse.duration_days is a plain int, which means every later read of
+        that plan fails response validation. One bad request would poison the row.
+
+        Omitting a field is how you leave it unchanged, so a null here is always a
+        client mistake and deserves a 422.
+
+        description is deliberately NOT in this list: its column is nullable and the
+        admin form sends `description: null` to clear it.
+
+        Pydantic does not run validators on defaults, so an omitted field never
+        reaches this and exclude_unset keeps working untouched.
+        """
+        if v is None:
+            raise ValueError("cannot be null - omit this field to leave it unchanged")
+        return v
 
 
 class PlanResponse(BaseModel):
@@ -71,6 +109,9 @@ class PlanResponse(BaseModel):
     price: float
     duration_days: int
     is_active: bool
+    # Typed as a plain str, not PlanTier, so a row holding an unexpected value still
+    # serializes instead of 500-ing. The frontend falls back to the Standard theme.
+    tier: str
     locations: List[GymLocationResponse] = []
     rule: Optional[RuleResponse] = None
 
@@ -79,6 +120,12 @@ class PlanResponse(BaseModel):
     @classmethod
     def handle_null_is_active(cls, v):
         return True if v is None else v
+
+    # Same reasoning for tier: rows written before the migration have no value.
+    @field_validator('tier', mode='before')
+    @classmethod
+    def handle_null_tier(cls, v):
+        return "Standard" if v is None else v
 
     model_config = ConfigDict(from_attributes=True)
 

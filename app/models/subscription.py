@@ -39,6 +39,14 @@ class SubscriptionPlan(Base):
     # NEW: Used for Soft Deletion (hiding old plans from the frontend)
     is_active = Column(Boolean, default=True)
 
+    # Drives the pricing-card styling on the member side ("Standard", "Pro", "VIP").
+    # Kept as a plain String (not an Enum) to match is_active/allowed_days, and so
+    # adding a tier later is a one-line schema change instead of a Postgres type
+    # migration. The allowed values are enforced in the Pydantic layer.
+    # server_default backfills existing rows during the ALTER TABLE; default covers
+    # ORM inserts, which never touch the server default.
+    tier = Column(String, default="Standard", server_default="Standard", nullable=False)
+
     # Relationships
     user_subscriptions = relationship("UserSubscription", back_populates="plan")
 
