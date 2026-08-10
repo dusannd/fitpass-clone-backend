@@ -11,7 +11,9 @@ from app.core.database import get_db
 from app.api.dependencies import RequireRole
 from app.models.coaching import TrainerClientLink, Appointment
 from app.models.user import User, Role
+from app.models.workout import WorkoutSession, ExerciseLog
 from app.schemas.coaching import CoachingRequestUpdate, TrainerClientLinkResponse, AppointmentCreate, AppointmentUpdate, AppointmentResponse
+from app.schemas.workout import WorkoutSessionResponse
 
 router = APIRouter()
 
@@ -136,6 +138,44 @@ async def get_my_clients(
             TrainerClientLink.trainer_id == trainer_id,
             TrainerClientLink.status == "ACCEPTED"
         )
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/clients/{client_id}/progress", response_model=List[WorkoutSessionResponse])
+async def get_client_progress(
+        client_id: int,
+        db: AsyncSession = Depends(get_db),
+        trainer_id: int = Depends(get_current_trainer)
+):
+    """
+    Trainer Route: Read one client's workout history so the trainer can see their
+    progress without having to ask them for numbers.
+    """
+    # 1. SECURITY CHECK: a trainer may only look at clients who accepted them.
+    # Without this any trainer could read any member's training data by guessing an id.
+    stmt_link = select(TrainerClientLink).where(
+        TrainerClientLink.trainer_id == trainer_id,
+        TrainerClientLink.client_id == client_id,
+        TrainerClientLink.status == "ACCEPTED"
+    )
+    result_link = await db.execute(stmt_link)
+    if not result_link.scalars().first():
+        raise HTTPException(
+            status_code=403,
+            detail="You can only view the progress of clients who accepted your coaching."
+        )
+
+    # 2. Same query the member runs on their own history, just for someone else's id.
+    stmt = (
+        select(WorkoutSession)
+        .options(
+            selectinload(WorkoutSession.exercise_logs)
+            .selectinload(ExerciseLog.exercise)
+        )
+        .where(WorkoutSession.user_id == client_id)
+        .order_by(WorkoutSession.date.desc())
     )
     result = await db.execute(stmt)
     return result.scalars().all()

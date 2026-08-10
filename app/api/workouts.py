@@ -145,7 +145,7 @@ async def log_workout_session(
         member_id: int = Depends(get_current_member)
 ):
     """
-    Member App: Log a completed workout session with actual performance stats (weight, sets, reps).
+    Member App: Log a completed workout session, one entry per set that was actually performed.
     """
     # 1. Create the parent session
     new_session = WorkoutSession(
@@ -156,12 +156,12 @@ async def log_workout_session(
     db.add(new_session)
     await db.flush()  # Flush to get the new_session.id
 
-    # 2. Add all exercise performance logs to this session
+    # 2. Add one row per completed set (the client sends a flat list of sets)
     for log in payload.exercises:
         new_log = ExerciseLog(
             session_id=new_session.id,
             exercise_id=log.exercise_id,
-            sets_completed=log.sets_completed,
+            set_number=log.set_number,
             reps_completed=log.reps_completed,
             weight_kg=log.weight_kg
         )

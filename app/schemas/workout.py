@@ -11,6 +11,11 @@ class ExerciseCreate(BaseModel):
     rest_time_seconds: Optional[int] = 60
     requires_weight: bool = True
 
+    # Trainer setup: target weight, the increment of that specific machine, and form cues.
+    recommended_weight_kg: Optional[float] = None
+    weight_step_kg: float = 2.5
+    instructions: Optional[str] = None
+
 
 class ExerciseResponse(BaseModel):
     id: int
@@ -18,7 +23,11 @@ class ExerciseResponse(BaseModel):
     sets: int
     reps: str
     rest_time_seconds: Optional[int]
-    requires_weight: bool        
+    requires_weight: bool
+    recommended_weight_kg: Optional[float] = None
+    weight_step_kg: float = 2.5
+    instructions: Optional[str] = None
+
     class Config:
         from_attributes = True
 
@@ -40,13 +49,14 @@ class WorkoutPlanResponse(BaseModel):
     created_at: datetime
     exercises: List[ExerciseResponse] = []
 
-model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- 3. WORKOUT LOGGING SCHEMAS (PROGRESS TRACKING) ---
 class ExerciseLogCreate(BaseModel):
+    """One single set. A 3 set exercise sends 3 of these."""
     exercise_id: int
-    sets_completed: int
+    set_number: int = 1
     reps_completed: str
     weight_kg: Optional[float] = None
 
@@ -54,7 +64,7 @@ class ExerciseLogCreate(BaseModel):
 class ExerciseLogResponse(BaseModel):
     id: int
     exercise_id: Optional[int]
-    sets_completed: int
+    set_number: int
     reps_completed: str
     weight_kg: Optional[float]
 

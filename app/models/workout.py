@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, Float, Boolean
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Table, Float, Boolean, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -49,6 +49,15 @@ class Exercise(Base):
     rest_time_seconds = Column(Integer, default=60, nullable=True)
     requires_weight = Column(Boolean, default=True, nullable=False)
 
+    # --- TRAINER SETUP (the client should never have to calculate anything) ---
+    # 1. The weight the trainer wants the client to start from. The app pre-fills it.
+    recommended_weight_kg = Column(Float, nullable=True)
+    # 2. How much one press of the "+" button adds. Every machine is different:
+    #    free weights go by 2.5 kg, cable stacks by 4.5 or 6.8 kg, drop-pins by 2.25 kg.
+    weight_step_kg = Column(Float, default=2.5, server_default="2.5", nullable=False)
+    # 3. Form cues shown at the top of the exercise card (e.g. "3 sec negatives").
+    instructions = Column(String, nullable=True)
+
     # Relationship back to the parent plan
     plan = relationship("WorkoutPlan", back_populates="exercises")
 
@@ -70,12 +79,24 @@ class WorkoutSession(Base):
     # Relationships
     user = relationship("User", back_populates="workout_sessions")
     plan = relationship("WorkoutPlan")
-    exercise_logs = relationship("ExerciseLog", back_populates="session", cascade="all, delete-orphan")
+    # order_by keeps the sets in the order they were performed, so the history
+    # screen never has to sort them again.
+    exercise_logs = relationship(
+        "ExerciseLog",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="ExerciseLog.exercise_id, ExerciseLog.set_number",
+    )
 
 
 class ExerciseLog(Base):
     """
-    Represents the actual performance (weight, sets, reps) of a specific exercise.
+    Represents the actual performance of ONE SINGLE SET of an exercise.
+
+    A 3 set bench press produces 3 rows, not 1. That is what lets the app show a
+    real set by set history ("60kg x 10, 60kg x 8, 55kg x 8") instead of a single
+    averaged number, and it is why the personal record is the maximum weight_kg
+    across all the rows of one exercise inside one session.
     """
     __tablename__ = "exercise_logs"
 
@@ -83,10 +104,17 @@ class ExerciseLog(Base):
     session_id = Column(Integer, ForeignKey("workout_sessions.id", ondelete="CASCADE"), nullable=False)
     exercise_id = Column(Integer, ForeignKey("exercises.id", ondelete="SET NULL"), nullable=True)
 
-    sets_completed = Column(Integer, nullable=False)
+    # Which set this row is, counting from 1.
+    set_number = Column(Integer, nullable=False, server_default="1")
     reps_completed = Column(String, nullable=False)
     weight_kg = Column(Float, nullable=True)
 
     # Relationships
     session = relationship("WorkoutSession", back_populates="exercise_logs")
     exercise = relationship("Exercise")
+
+    # Every read groups the rows by (session, exercise), and we now write roughly
+    # three times as many rows, so give that pair its own index.
+    __table_args__ = (
+        Index("ix_exercise_logs_session_exercise", "session_id", "exercise_id"),
+    )
