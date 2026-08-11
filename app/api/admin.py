@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -10,7 +10,7 @@ from app.api.dependencies import get_current_admin
 from app.models.access import EntryLog
 from app.models.user import User, Role
 from app.schemas.access import AdminEntryLogResponse
-from app.schemas.user import RoleManageRequest
+from app.schemas.user import RoleManageRequest, StaffResponse
 
 
 router = APIRouter()
@@ -115,6 +115,47 @@ async def audit_worker_overrides(
         .order_by(EntryLog.timestamp.desc())
         .offset(skip)  # <--- NEW: Apply skip
         .limit(limit)  # <--- Applied limit
+    )
+
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+# The roles that make somebody "staff". Named once so the HR list and any future
+# staff-only check cannot drift apart.
+STAFF_ROLES = ["admin", "worker", "trainer"]
+
+
+@router.get("/hr/staff", response_model=List[StaffResponse])
+async def get_staff(
+        limit: int = Query(200, ge=1, le=500, description="Safety cap on the staff list"),
+        db: AsyncSession = Depends(get_db),
+        admin_id: int = Depends(get_current_admin)
+):
+    """
+    HR Panel: Returns every user holding at least one staff role.
+
+    The panel used to fetch GET /users/ and filter for staff in the browser. That
+    endpoint caps at 50 rows, so once the gym grew past 50 users any staff member
+    outside that first page silently vanished from the list - no error, no empty
+    state, just a missing person. Filtering in the database instead means the
+    response contains the staff themselves rather than whichever staff happen to
+    sit in the first page of the users table.
+    """
+    stmt = (
+        select(User)
+        # .any() builds an EXISTS over the user_roles table, so somebody holding
+        # two staff roles still comes back as exactly one row - no join fan-out
+        # to clean up afterwards with .distinct().
+        .where(User.roles.any(Role.name.in_(STAFF_ROLES)))
+        # Redundant today (User.roles is lazy="selectin" on the model) but stated
+        # anyway, so this endpoint cannot quietly turn into N+1 if that default
+        # ever changes.
+        .options(selectinload(User.roles))
+        # id last so the list cannot reshuffle between refreshes when two people
+        # share a name.
+        .order_by(User.first_name, User.last_name, User.id)
+        .limit(limit)
     )
 
     result = await db.execute(stmt)

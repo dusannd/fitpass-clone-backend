@@ -98,6 +98,26 @@ class RoleManageRequest(BaseModel):
     role_name: str
 
 
+class StaffResponse(BaseModel):
+    """
+    A single staff row for the Admin HR panel.
+
+    Deliberately leaner than UserResponse: the panel only renders a name, an email
+    and role badges, so shipping every staff member's whole subscription history
+    and profile bio along with it would be far more data than the screen uses.
+
+    first_name and last_name stay Optional because the columns are nullable, so an
+    account created with nothing but an email still serializes instead of raising.
+    """
+    id: int
+    email: EmailStr
+    first_name: Optional[str]
+    last_name: Optional[str]
+    roles: List[RoleResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # --- PASSWORD RESET SCHEMAS ---
 class PasswordResetRequest(BaseModel):
     email: EmailStr
