@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_, func
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
 
 from app.core.database import get_db
+from app.core.redis_client import redis_db
 from app.core.websockets import ws_manager
-from app.models.user import User
+from app.models.user import User, Role
 from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.api.dependencies import RequireRole
@@ -16,6 +17,87 @@ router = APIRouter()
 
 # Bouncer for the desk worker role
 get_current_worker = RequireRole("worker")
+
+
+def _build_like_pattern(raw: str) -> str:
+    """
+    Turns what the worker typed into a safe 'contains' LIKE pattern.
+
+    '%' and '_' are wildcards in SQL. Without escaping them, a worker typing a
+    single '%' would match every user in the database, which is both a useless
+    result and a needless full table scan. The backslash itself goes first,
+    otherwise we would escape the escapes we just added.
+    """
+    escaped = raw.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _full_name(user: User | None) -> str:
+    """
+    Builds a display name that survives missing data.
+
+    first_name and last_name are nullable, so an account created with nothing but
+    an email would otherwise render as the literal string "None None" on the desk
+    panel. Falls back to a placeholder rather than an empty string, so a row never
+    looks like a rendering bug to the worker reading it.
+    """
+    if user is None:
+        return "Unknown user"
+
+    return f"{user.first_name or ''} {user.last_name or ''}".strip() or "Unknown user"
+
+
+@router.get("/search")
+async def search_users(
+        query: str = Query(..., min_length=2, max_length=50, description="Name or email fragment"),
+        db: AsyncSession = Depends(get_db),
+        worker_id: int = Depends(get_current_worker)
+):
+    """
+    Desk worker autocomplete: find a member by name or email.
+
+    Exists so the worker never has to know a numeric user ID - they type what the
+    member tells them (a name or an email) and pick the row.
+
+    Restricted to active members on purpose. Without the role join the dropdown
+    also offers trainers, admins and other workers - handing out staff email
+    addresses to anyone on the desk - and without is_active it offers accounts
+    that were deactivated precisely so they could not get through the door.
+    """
+    pattern = _build_like_pattern(query)
+
+    # The fourth condition matches against "first last" as one string, so typing
+    # a full name finds the person. SQLAlchemy renders '+' on String columns as
+    # the SQL concat operator, which works on both Postgres and SQLite.
+    stmt = (
+        select(User)
+        .join(User.roles)  # Same role join coaching.py and workouts.py use
+        .where(
+            Role.name == "member",
+            User.is_active == True,
+            or_(
+                User.first_name.ilike(pattern, escape="\\"),
+                User.last_name.ilike(pattern, escape="\\"),
+                User.email.ilike(pattern, escape="\\"),
+                (User.first_name + " " + User.last_name).ilike(pattern, escape="\\"),
+            )
+        )
+        .distinct()  # A many-to-many join can repeat a row; the dropdown must not
+        .order_by(User.first_name, User.last_name, User.id)
+        .limit(10)  # Autocomplete, not a report - 10 rows is all a dropdown can show
+    )
+
+    result = await db.execute(stmt)
+    users = result.scalars().all()
+
+    return [
+        {
+            "user_id": user.id,
+            "full_name": _full_name(user),
+            "email": user.email,
+        }
+        for user in users
+    ]
 
 
 @router.post("/manual-entry/{target_user_id}")
@@ -47,12 +129,21 @@ async def manual_entry_override(
         worker_id=worker_id,
         location_id=location_id,  # <--- NEW: Store the location in the log
         access_granted=True,
+        action_type="ENTRY",  # Spelled out rather than leaning on the column default
         reason="Manual Override by Desk Worker"
     )
 
     db.add(entry_log)
     await db.commit()
     await db.refresh(entry_log)
+
+    # Mark the member as INSIDE for anti-passback. Redis is what the turnstile
+    # actually reads (app/api/access.py), and it only rebuilds itself from the
+    # database when the key is MISSING - so without this write the member keeps
+    # the stale "OUTSIDE" left over from their last exit, and could generate a
+    # second ENTRY QR and walk in again on the back of this one override.
+    # force_checkout below does the mirror image of this.
+    await redis_db.set(f"user_status:{target_user.id}", "INSIDE")
 
     # Notify the member's dashboard in real-time so it resyncs instantly
     await ws_manager.send_personal_message(
@@ -67,7 +158,7 @@ async def manual_entry_override(
 
     return {
         "status": "success",
-        "message": f"DOOR OPENED! User {target_user.first_name} was let in by worker ID {worker_id}",
+        "message": f"DOOR OPENED! User {_full_name(target_user)} was let in by worker ID {worker_id}",
         "log_id": entry_log.id
     }
 
@@ -110,7 +201,7 @@ async def check_user_status(
     if not active_sub_record:
         return {
             "user_id": user.id,
-            "full_name": f"{user.first_name} {user.last_name}",
+            "full_name": _full_name(user),
             "email": user.email,
             "has_active_subscription": False,
             "message": "User DOES NOT have an active subscription! Do not let them in."
@@ -124,7 +215,7 @@ async def check_user_status(
 
     return {
         "user_id": user.id,
-        "full_name": f"{user.first_name} {user.last_name}",
+        "full_name": _full_name(user),
         "email": user.email,
         "has_active_subscription": True,
         "plan_name": plan_name,
@@ -136,53 +227,123 @@ async def check_user_status(
 
 @router.get("/currently-inside")
 async def get_currently_inside(
+        skip: int = Query(0, ge=0, description="Pagination offset"),
+        limit: int = Query(10, ge=1, le=50, description="Max 50 records per page"),
         db: AsyncSession = Depends(get_db),
         worker_id: int = Depends(get_current_worker)
 ):
     """
-    Worker Dashboard: Returns a list of all users currently inside the gym.
-    Uses a SQL Subquery to find the absolute latest log for each user,
-    and checks if that latest log was a successful 'ENTRY'.
+    Worker Dashboard: Returns the users currently inside the gym, one page at a time.
+    A user is inside when their latest GRANTED log was an 'ENTRY'.
+
+    Paginated because a busy gym would otherwise ship the entire floor on every
+    single request. 'total' is still the real headcount, so the panel can show
+    "42 Active" while only rendering the ten rows it asked for.
     """
-    # 1. Subquery: Find the MAX timestamp (latest log) for each user
-    subq = (
-        select(EntryLog.user_id, func.max(EntryLog.timestamp).label("max_ts"))
-        .group_by(EntryLog.user_id)
+    # 1. Rank each user's GRANTED logs, newest first.
+    #    Denied rows are thrown out BEFORE the ranking on purpose: a refused scan
+    #    never moved anybody through a door, so it must not change who counts as
+    #    inside. Ranking over every row instead - as this used to - meant one
+    #    denied re-scan made a member who was genuinely in the building vanish
+    #    from the list, leaving a person nobody could see or force-check-out.
+    #    This mirrors resolve_user_status() in app/api/access.py, which is what
+    #    the turnstile itself trusts; the two have to agree.
+    ranked = (
+        select(
+            EntryLog.id,
+            func.row_number().over(
+                partition_by=EntryLog.user_id,
+                # The id tiebreaker is not cosmetic: two logs can share a
+                # timestamp, and without it such a user would rank two rows first
+                # and appear twice.
+                order_by=(EntryLog.timestamp.desc(), EntryLog.id.desc()),
+            ).label("rn"),
+        )
+        .where(EntryLog.access_granted == True)
         .subquery()
     )
 
-    # 2. Main Query: Join EntryLog with the subquery to get the actual row data
-    stmt = (
+    # 2. Base Query: keep each user's newest granted log, and only if it was an ENTRY
+    base = (
         select(EntryLog)
-        .join(
-            subq,
-            and_(
-                EntryLog.user_id == subq.c.user_id,
-                EntryLog.timestamp == subq.c.max_ts
-            )
-        )
-        .where(
-            EntryLog.action_type == "ENTRY",
-            EntryLog.access_granted == True
-        )
+        .join(ranked, and_(EntryLog.id == ranked.c.id, ranked.c.rn == 1))
+        .where(EntryLog.action_type == "ENTRY")
+    )
+
+    # 3. Count the whole result set before slicing it, so the badge stays honest
+    total = await db.scalar(select(func.count()).select_from(base.subquery()))
+
+    # 4. The page itself. The secondary sort on id is not cosmetic: 'timestamp'
+    #    comes from the database clock, so two scans can tie, and paginating over
+    #    an unstable sort silently repeats or skips rows between pages.
+    stmt = (
+        base
         .options(selectinload(EntryLog.user))  # Eager load user data
-        .order_by(EntryLog.timestamp.desc())
+        .order_by(EntryLog.timestamp.desc(), EntryLog.id.desc())
+        .offset(skip)
+        .limit(limit)
     )
 
     result = await db.execute(stmt)
     active_logs = result.scalars().all()
 
-    # 3. Format the response for the frontend
-    response = []
+    # 5. Format the response for the frontend
+    items = []
     for log in active_logs:
-        response.append({
+        items.append({
             "user_id": log.user.id,
-            "full_name": f"{log.user.first_name} {log.user.last_name}",
+            "full_name": _full_name(log.user),
             "email": log.user.email,
             "entered_at": log.timestamp
         })
 
-    return response
+    return {"total": total or 0, "items": items}
+
+
+@router.get("/logs")
+async def get_recent_logs(
+        skip: int = Query(0, ge=0, description="Pagination offset"),
+        limit: int = Query(10, ge=1, le=50, description="Max 50 records per page"),
+        db: AsyncSession = Depends(get_db),
+        worker_id: int = Depends(get_current_worker)
+):
+    """
+    Worker Dashboard: Chronological feed of every entry, exit and denied scan.
+
+    The desk worker needs this to answer "who just walked through?" without
+    calling an admin - the admin audit endpoints are role gated and filtered to
+    manual overrides only.
+    """
+    # 1. Total row count, so the panel can render "Page 3 of 12"
+    total = await db.scalar(select(func.count()).select_from(EntryLog))
+
+    # 2. Newest first, with the same id tiebreaker the attendance list uses.
+    #    selectinload keeps the loop below from lazy loading each user, which
+    #    under asyncio would not just be an N+1 but a MissingGreenlet crash.
+    stmt = (
+        select(EntryLog)
+        .options(selectinload(EntryLog.user))
+        .order_by(EntryLog.timestamp.desc(), EntryLog.id.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+
+    result = await db.execute(stmt)
+    logs = result.scalars().all()
+
+    items = []
+    for log in logs:
+        items.append({
+            "id": log.id,
+            "user_id": log.user_id,
+            "full_name": _full_name(log.user),
+            "action_type": log.action_type,
+            "access_granted": log.access_granted,
+            "reason": log.reason,
+            "timestamp": log.timestamp,
+        })
+
+    return {"total": total or 0, "items": items}
 
 
 @router.post("/force-checkout/{target_user_id}")
@@ -195,9 +356,6 @@ async def force_checkout(
     Worker Dashboard: Forcefully checks out a user if they forgot to scan the exit QR.
     Frees up their Redis status so they can enter again next time.
     """
-    # Import inside the function to avoid circular import issues
-    from app.core.redis_client import redis_db
-
     # 1. Reset Redis state to OUTSIDE
     redis_key = f"user_status:{target_user_id}"
     await redis_db.set(redis_key, "OUTSIDE")

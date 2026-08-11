@@ -8,6 +8,8 @@ from app.main import app
 from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.models.coaching import Appointment
+from app.models.access import EntryLog
+from app.models.user import User, Role
 
 limiter.enabled = False
 settings.TESTING = True
@@ -69,3 +71,108 @@ def backdate_appointment():
             await session.commit()
 
     return _backdate
+
+
+@pytest.fixture
+def seed_entry_logs():
+    """
+    Writes turnstile logs straight into the database.
+
+    There is no API that lets a test create an arbitrary log - a real one only
+    appears when somebody scans a QR code - so the worker panel endpoints have to
+    be given their data directly.
+
+    Every row gets an EXPLICIT timestamp. The column's server_default is the
+    database clock, and SQLite's CURRENT_TIMESTAMP only has second resolution, so
+    a loop of inserts would produce identical timestamps and make every ordering
+    assertion in the worker tests a coin flip.
+
+    Lives here rather than in a test module for the same reason as the fixture
+    above: test/ has no __init__.py, so it is not importable as a package.
+    """
+    async def _seed(entries: list[dict]):
+        created_ids = []
+        async with TestingSessionLocal() as session:
+            for offset, entry in enumerate(entries):
+                log = EntryLog(
+                    user_id=entry["user_id"],
+                    worker_id=entry.get("worker_id"),
+                    access_granted=entry.get("access_granted", True),
+                    action_type=entry.get("action_type", "ENTRY"),
+                    reason=entry.get("reason"),
+                    # Caller order is oldest -> newest unless it says otherwise
+                    timestamp=entry.get(
+                        "timestamp",
+                        datetime.now(timezone.utc) - timedelta(minutes=len(entries) - offset),
+                    ),
+                )
+                session.add(log)
+                await session.flush()
+                created_ids.append(log.id)
+
+            await session.commit()
+        return created_ids
+
+    return _seed
+
+
+@pytest.fixture
+def set_user_roles():
+    """
+    REPLACES a user's roles with the ones named.
+
+    POST /users/ always hands out "member", and promoting someone through the
+    admin API would mean building an admin account and a JWT first. Replacing
+    rather than appending is the point: a test for "only members show up" needs a
+    user who is NOT a member.
+    """
+    async def _set(user_id: int, role_names: list[str]):
+        async with TestingSessionLocal() as session:
+            user = (await session.execute(
+                select(User).where(User.id == user_id)
+            )).scalars().first()
+
+            roles = []
+            for name in role_names:
+                role = (await session.execute(
+                    select(Role).where(Role.name == name)
+                )).scalars().first()
+
+                # The roles table is seeded lazily by whoever needs a role first,
+                # so a test may well be the first thing to ask for "trainer".
+                if not role:
+                    role = Role(name=name, description=f"{name} (created by a test)")
+                    session.add(role)
+                    await session.flush()
+
+                roles.append(role)
+
+            user.roles = roles
+            session.add(user)
+            await session.commit()
+
+    return _set
+
+
+@pytest.fixture
+def clear_user_name():
+    """
+    Nulls out a user's first and last name.
+
+    UserCreate requires both, so the API cannot produce this state - but the
+    columns are nullable, and rows like this exist in older databases. It is the
+    only way to test that the panel renders a fallback instead of "None None".
+    """
+    async def _clear(user_id: int):
+        async with TestingSessionLocal() as session:
+            user = (await session.execute(
+                select(User).where(User.id == user_id)
+            )).scalars().first()
+
+            user.first_name = None
+            user.last_name = None
+
+            session.add(user)
+            await session.commit()
+
+    return _clear
