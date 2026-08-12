@@ -51,6 +51,63 @@ app = FastAPI(
 )
 
 
+# ==========================================
+# MIDDLEWARE - THE REGISTRATION ORDER BELOW IS LOAD-BEARING
+# ==========================================
+# add_middleware inserts at the FRONT of the stack, so whatever is registered
+# last ends up outermost. The three blocks below therefore produce:
+#
+#   ServerErrorMiddleware -> add_security_headers -> CORSMiddleware
+#                         -> catch_unhandled_errors -> ExceptionMiddleware -> router
+#
+# which is what lets a crash come back as an ordinary response that still passes
+# through CORS and the header stamping on its way out. Reorder these and the 500
+# silently loses those headers again - test_middleware_order_is_load_bearing is
+# there to catch exactly that.
+
+GENERIC_500_DETAIL = "Internal server error. Please try again later."
+
+
+def internal_error_response() -> JSONResponse:
+    """
+    The only 500 body a client is ever allowed to see.
+
+    Shared by the middleware and the fallback handler below so the two can never
+    drift into answering differently.
+    """
+    return JSONResponse(status_code=500, content={"detail": GENERIC_500_DETAIL})
+
+
+# --- 1. INNERMOST: turn a crash into a normal response ---
+@app.middleware("http")
+async def catch_unhandled_errors(request: Request, call_next):
+    """
+    Catches unhandled exceptions here rather than leaving them to the exception
+    handler at the bottom of this file.
+
+    The reason is placement. A handler registered for the Exception key is pulled
+    out of ExceptionMiddleware by build_middleware_stack and handed to
+    ServerErrorMiddleware, which sits ABOVE every user middleware. A 500 produced
+    up there has already skipped CORS and the security headers - so a browser on a
+    different origin blocks the response outright and the SPA sees a network error
+    with no status instead of a clean 500.
+
+    Catching in here means the 500 is just a response travelling back up the stack
+    like any other.
+
+    HTTPException, RequestValidationError and slowapi's RateLimitExceeded never
+    arrive here - ExceptionMiddleware sits further in and resolves them first.
+    Client disconnects do not either: anyio raises CancelledError, which derives
+    from BaseException, so it unwinds normally instead of becoming a bogus 500.
+    """
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return internal_error_response()
+
+
+# --- 2. CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins = settings.CORS_ORIGINS,
@@ -63,7 +120,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-# --- SECURITY HEADERS ---
+# --- 3. OUTERMOST: security headers ---
 # Swagger UI loads swagger-ui-bundle.js and swagger-ui.css from cdn.jsdelivr.net,
 # so a "default-src 'self'" policy renders /docs as a blank page. These three are
 # a developer tool with no user data on them, so they are the one place the policy
@@ -76,9 +133,9 @@ async def add_security_headers(request: Request, call_next):
     """
     Stamps the baseline security headers onto every response.
 
-    Registered AFTER the CORS middleware on purpose: add_middleware inserts at the
-    front of the stack, so whatever is added last ends up outermost. That means
-    CORS preflight responses get these headers too.
+    Registered last so it ends up outermost, which is what makes it reach CORS
+    preflight responses too - CORSMiddleware answers those itself and never calls
+    inward, so anything registered below it would miss them.
     """
     response = await call_next(request)
 
@@ -107,27 +164,23 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# --- GLOBAL ERROR HANDLER ---
+# --- LAST RESORT: the net above the middleware ---
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """
-    Turns any unhandled crash into a generic 500 instead of a stack trace.
+    Answers with the same generic 500 for anything catch_unhandled_errors cannot
+    reach - a failure inside the security header middleware, or inside CORS.
 
-    Without this the client receives the raw exception, which for a database error
-    means the SQL statement and often the connection details along with it.
+    Registering the Exception key installs this on ServerErrorMiddleware, the
+    outermost layer of all, so it covers what the middleware above cannot. That
+    also means a 500 produced here has bypassed CORS and the header stamping,
+    which is precisely why it is the fallback and not the main path.
 
-    Only genuinely unhandled errors reach here. FastAPI routes HTTPException and
-    RequestValidationError to their own handlers further down the stack, so the
-    existing 400/403/404 responses - and slowapi's 429 - are untouched.
-
-    logger.exception is the whole point of the function: the traceback still has to
-    reach the server log, it just must not reach the client.
+    The two never both run for one request: if the middleware handled the error,
+    execution never gets here, so nothing is logged twice.
     """
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error. Please try again later."},
-    )
+    return internal_error_response()
 
 # --- STATIC FILES (Profile pictures) ---
 # Mounted under /api on purpose: the Vite dev server runs on HTTPS and already
