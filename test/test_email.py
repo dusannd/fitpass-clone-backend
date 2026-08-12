@@ -1,3 +1,6 @@
+import logging
+import smtplib
+
 import pytest
 
 from app.core.config import settings
@@ -161,3 +164,224 @@ async def test_send_verification_email_works_without_a_name(monkeypatch, capsys)
     assert "https://gym.example/verify-email?token=tok123" in printed
     assert "Hi there," in printed
     assert "HTML part: attached" in printed
+
+
+# ==========================================
+# 5. SMTP TRANSPORT
+# ==========================================
+APP_PASSWORD_AS_GOOGLE_SHOWS_IT = "abcd efgh ijkl mnop"
+APP_PASSWORD_JOINED = "abcdefghijklmnop"
+
+
+class FakeSMTP:
+    """
+    Stands in for smtplib.SMTP / smtplib.SMTP_SSL and records what was asked of it.
+
+    Every instance appends itself to `created`, so a test can see WHICH class was
+    constructed - that is the whole difference between the port 587 and the port
+    465 paths, and it is invisible from the message alone.
+
+    `login_error` makes the connection fail the way a bad App Password does,
+    without needing a network.
+    """
+
+    created: list["FakeSMTP"] = []
+    login_error: Exception | None = None
+
+    def __init__(self, host, port, timeout=None, **kwargs):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.started_tls = False
+        self.login_args = None
+        self.message = None
+        FakeSMTP.created.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def starttls(self, *args, **kwargs):
+        self.started_tls = True
+
+    def login(self, user, password):
+        self.login_args = (user, password)
+        if FakeSMTP.login_error is not None:
+            raise FakeSMTP.login_error
+
+    def send_message(self, msg):
+        self.message = msg
+
+
+class FakeSMTP_SSL(FakeSMTP):
+    """Same recorder, distinguishable by class - 465 must reach this one."""
+
+
+@pytest.fixture
+def smtp(monkeypatch):
+    """
+    Wires a Gmail-shaped configuration onto a recording transport.
+
+    SMTPEmailProvider is used directly rather than through get_email_provider(),
+    so settings.TESTING (True via conftest) never diverts this to the mock.
+    """
+    FakeSMTP.created = []
+    FakeSMTP.login_error = None
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSMTP_SSL)
+
+    monkeypatch.setattr(settings, "SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setattr(settings, "SMTP_PORT", 587)
+    monkeypatch.setattr(settings, "SMTP_USER", "gym@gmail.com")
+    monkeypatch.setattr(settings, "SMTP_PASS", APP_PASSWORD_AS_GOOGLE_SHOWS_IT)
+    monkeypatch.setattr(settings, "EMAIL_FROM_NAME", "FitPass")
+
+    return FakeSMTP
+
+
+async def send_one() -> FakeSMTP:
+    """Sends a message through the provider and hands back the connection it used."""
+    from app.services.email import SMTPEmailProvider
+
+    await SMTPEmailProvider().send_email(
+        to_email="member@example.com",
+        subject="Verify your FitPass Clone Account",
+        text_body="plain text fallback",
+        html_body="<p>html body</p>",
+    )
+    assert FakeSMTP.created, "no connection was opened at all"
+    return FakeSMTP.created[-1]
+
+
+@pytest.mark.asyncio
+async def test_app_password_spaces_are_stripped(smtp):
+    """
+    Google displays the App Password in four groups of four, and it is copied out
+    of that screen with the spaces still in it.
+
+    smtplib would send them verbatim and Gmail answers 535 "Username and Password
+    not accepted" - which reads like a wrong password, so the spaces are the last
+    thing anyone suspects.
+    """
+    connection = await send_one()
+
+    assert connection.login_args == ("gym@gmail.com", APP_PASSWORD_JOINED)
+
+
+@pytest.mark.asyncio
+async def test_from_header_is_the_authenticated_account(smtp, monkeypatch):
+    """
+    Gmail refuses to relay a From header for an address it does not own.
+
+    EMAIL_FROM defaults to Resend's onboarding@resend.dev, so honouring it here
+    would have every message rejected the moment the account switched to Gmail.
+    """
+    monkeypatch.setattr(settings, "EMAIL_FROM", "onboarding@resend.dev")
+
+    connection = await send_one()
+
+    assert connection.message["From"] == "FitPass <gym@gmail.com>"
+    assert "resend.dev" not in connection.message["From"]
+
+
+@pytest.mark.asyncio
+async def test_port_587_uses_starttls(smtp):
+    """587 opens in the clear and has to be upgraded before login."""
+    connection = await send_one()
+
+    assert type(connection) is FakeSMTP
+    assert connection.started_tls is True
+
+
+@pytest.mark.asyncio
+async def test_port_465_uses_implicit_tls(smtp, monkeypatch):
+    """
+    465 is TLS from the first byte, so there is no plaintext greeting to upgrade.
+
+    Calling starttls() on it does not error - it waits for a response that never
+    comes, and the send simply hangs until the timeout.
+    """
+    monkeypatch.setattr(settings, "SMTP_PORT", 465)
+
+    connection = await send_one()
+
+    assert type(connection) is FakeSMTP_SSL
+    assert connection.started_tls is False
+
+
+@pytest.mark.asyncio
+async def test_connection_has_a_timeout(smtp):
+    """
+    _send_sync runs through asyncio.to_thread, so a connection with no timeout
+    holds a threadpool worker for as long as the server stays silent - which,
+    with no timeout, is forever.
+    """
+    connection = await send_one()
+
+    assert connection.timeout is not None
+    assert connection.timeout > 0
+
+
+@pytest.mark.asyncio
+async def test_text_part_precedes_html_part(smtp):
+    """
+    A multipart/alternative client renders the LAST part it understands, so the
+    plain text has to come first. Reversed, every modern client shows the plain
+    text version and the branded template is never seen.
+    """
+    connection = await send_one()
+
+    subtypes = [part.get_content_subtype() for part in connection.message.get_payload()]
+    assert subtypes == ["plain", "html"]
+
+
+@pytest.mark.asyncio
+async def test_send_failure_is_logged_and_never_raises(smtp, caplog):
+    """
+    A rejected login must surface in the log and stop there.
+
+    This runs inside a BackgroundTask: /register answered 200 long ago, so raising
+    would only produce an unhandled error in a background thread with nobody to
+    report it to. Swallowing it silently is the other failure - that is how the
+    current setup delivers nothing and says nothing.
+    """
+    FakeSMTP.login_error = smtplib.SMTPAuthenticationError(
+        535, b"5.7.8 Username and Password not accepted"
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.email"):
+        await send_one()  # must not raise
+
+    assert "SMTP send to member@example.com failed" in caplog.text
+    # The server's own reply is the useful half - it says WHY.
+    assert "535" in caplog.text
+    # The password must never reach the log, in either form.
+    assert APP_PASSWORD_JOINED not in caplog.text
+    assert APP_PASSWORD_AS_GOOGLE_SHOWS_IT not in caplog.text
+    # A rejected send must not also announce success.
+    assert "Email sent via SMTP" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_successful_send_is_never_reported_as_a_failure(smtp, caplog):
+    """
+    The success notice must sit OUTSIDE the try, and must stay ASCII.
+
+    Regression, found by actually sending one: the line used to be a print with a
+    check mark emoji, inside the try. Windows falls back to cp1252 whenever stdout
+    is redirected rather than a console, so that character raised
+    UnicodeEncodeError - and the except caught it and logged "SMTP send failed"
+    for a message the server had already accepted.
+
+    A log that reports a delivered email as lost sends you hunting through Google
+    account settings for a problem that does not exist.
+    """
+    with caplog.at_level(logging.INFO, logger="app.services.email"):
+        connection = await send_one()
+
+    # The message really did reach the transport...
+    assert connection.message is not None
+    # ...and nothing anywhere claimed otherwise.
+    assert "Email sent via SMTP to member@example.com" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

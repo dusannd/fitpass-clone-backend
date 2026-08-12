@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     # --- EMAIL SETTINGS ---
     EMAIL_FROM: str = "onboarding@resend.dev"
+    # The display name in front of the address, so the inbox shows
+    # "FitPass <gym@gmail.com>" rather than a bare address.
+    EMAIL_FROM_NAME: str = "FitPass"
     RESEND_API_KEY: Optional[str] = None
 
     # SMTP Fallbacks

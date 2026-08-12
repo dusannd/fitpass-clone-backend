@@ -1,10 +1,12 @@
 import jwt
+import logging
 import re
 import smtplib
 import asyncio
 import resend
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -12,6 +14,8 @@ from html import escape
 from pathlib import Path
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Configure Resend API Key
 if settings.RESEND_API_KEY:
@@ -126,19 +130,53 @@ class ResendEmailProvider(EmailProvider):
         try:
             # Wrap the synchronous Resend SDK call in a background thread
             await asyncio.to_thread(self._send_sync, to_email, subject, text_body, html_body)
-            print(f"✅ Real email successfully sent via Resend to: {to_email}")
-        except Exception as e:
-            print(f"❌ Failed to send email via Resend to {to_email}. Error: {e}")
+        except Exception:
+            # Logged rather than printed, and never re-raised: this runs inside a
+            # BackgroundTask, so /register has already answered 200 and there is
+            # nobody left to hand the error to.
+            logger.exception("Resend send to %s failed", to_email)
+            return
+
+        # Outside the try on purpose - see SMTPEmailProvider.send_email below.
+        logger.info("Email sent via Resend to %s", to_email)
 
 
 # ==========================================
-# OLD: SMTP & MOCK PROVIDERS (Still here if needed)
+# SMTP PROVIDER (Gmail and anything else speaking SMTP)
 # ==========================================
+# A hung connection here pins a thread from the asyncio threadpool for as long as
+# it lasts, because _send_sync runs through asyncio.to_thread. Without a timeout
+# that is forever.
+SMTP_TIMEOUT_SECONDS = 10
+
+# The port Gmail (and most providers) serve implicit TLS on. Everything else is
+# assumed to be the STARTTLS style, which is what 587 does.
+IMPLICIT_TLS_PORT = 465
+
+
 class SMTPEmailProvider(EmailProvider):
+    def _smtp_password(self) -> str:
+        """
+        The App Password with its display formatting removed.
+
+        Google shows the App Password as four groups of four ("abcd efgh ijkl
+        mnop"). Pasted into .env straight off that screen it keeps the spaces,
+        smtplib sends them verbatim, and Gmail answers "535 Username and Password
+        not accepted" - which reads exactly like a wrong password and sends you
+        looking in the wrong place. App passwords never legitimately contain
+        whitespace, so stripping it can only ever be the right reading.
+        """
+        return "".join((settings.SMTP_PASS or "").split())
+
     def _send_sync(self, to_email: str, subject: str, text_body: str, html_body: str | None):
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = settings.EMAIL_FROM
+
+        # The sender is the authenticated account, NOT settings.EMAIL_FROM.
+        # EMAIL_FROM defaults to Resend's onboarding@resend.dev, and Gmail refuses
+        # to relay a From header for an address it does not own. Deriving it from
+        # SMTP_USER means the two can never disagree.
+        msg["From"] = formataddr((settings.EMAIL_FROM_NAME, settings.SMTP_USER))
         msg["To"] = to_email
 
         # ORDER MATTERS. In a multipart/alternative message the client picks the
@@ -149,17 +187,41 @@ class SMTPEmailProvider(EmailProvider):
         if html_body:
             msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
-            server.starttls()
-            server.login(settings.SMTP_USER, settings.SMTP_PASS)
+        # Port 465 is TLS from the first byte, so there is no plaintext greeting
+        # to upgrade - calling starttls() on it just blocks until the timeout.
+        # Port 587 is the opposite: it starts in the clear and must be upgraded.
+        if settings.SMTP_PORT == IMPLICIT_TLS_PORT:
+            server_cls, needs_starttls = smtplib.SMTP_SSL, False
+        else:
+            server_cls, needs_starttls = smtplib.SMTP, True
+
+        with server_cls(
+            settings.SMTP_HOST, settings.SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS
+        ) as server:
+            if needs_starttls:
+                server.starttls()
+            server.login(settings.SMTP_USER, self._smtp_password())
             server.send_message(msg)
 
     async def send_email(self, to_email: str, subject: str, text_body: str, html_body: str | None = None):
         try:
             await asyncio.to_thread(self._send_sync, to_email, subject, text_body, html_body)
-            print(f"✅ Real email successfully sent via SMTP to: {to_email}")
-        except Exception as e:
-            print(f"❌ Failed to send email via SMTP to {to_email}. Error: {e}")
+        except Exception:
+            # Only the recipient goes into the message. The traceback carries the
+            # server's own reply - a 535 or a 534 says precisely what is wrong -
+            # and no SMTP error echoes the credentials back.
+            logger.exception("SMTP send to %s failed", to_email)
+            return
+
+        # The success notice sits OUTSIDE the try, and carries no emoji.
+        #
+        # Both details were paid for: this line used to be a print with a "check
+        # mark" inside the try block. Windows falls back to cp1252 whenever stdout
+        # is redirected rather than a console, so printing that character raised
+        # UnicodeEncodeError - which the except above then caught and reported as a
+        # failed send. The mail had already been accepted by the server. A log that
+        # lies about delivery is worse than no log at all.
+        logger.info("Email sent via SMTP to %s", to_email)
 
 
 class MockEmailProvider(EmailProvider):
@@ -205,6 +267,26 @@ def get_email_provider() -> EmailProvider:
 
     print("⚠️ WARNING: No email credentials found. Using MockEmailProvider.")
     return MockEmailProvider()
+
+
+def describe_email_provider() -> str:
+    """
+    One line naming the provider that is actually live, for the startup log.
+
+    "Which provider am I even using" is the first question when mail goes
+    missing, and the factory above decides it silently from whichever credentials
+    happen to be present - drop RESEND_API_KEY back into .env and SMTP stops
+    being used without a word.
+
+    Carries no credentials: the host, the port and the sending address only.
+    """
+    provider = type(get_email_provider()).__name__
+
+    if provider == "SMTPEmailProvider":
+        return f"{provider} ({settings.SMTP_HOST}:{settings.SMTP_PORT}, as {settings.SMTP_USER})"
+    if provider == "ResendEmailProvider":
+        return f"{provider} (as {settings.EMAIL_FROM})"
+    return f"{provider} (nothing is actually sent)"
 
 
 async def send_verification_email(email: str, token: str, name: str | None = None):

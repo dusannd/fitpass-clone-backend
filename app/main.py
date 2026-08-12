@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
 from app.core.redis_client import check_redis_connection, close_redis_connection
+from app.services.email import describe_email_provider
 from app.services.scheduler import start_scheduler
 from app.services.storage import STATIC_DIR, AVATAR_DIR
 
@@ -35,6 +36,10 @@ from app.api import users, subscriptions, access, admin, worker, payments, train
 async def lifespan(app: FastAPI):
 
     print("Starting up FastAPI server...")
+    # Printed at boot because the provider is chosen silently from whichever
+    # credentials happen to be in .env - a missing email is otherwise indis-
+    # tinguishable from a provider that was never picked in the first place.
+    print(f"Email provider: {describe_email_provider()}")
     start_scheduler()
     await check_redis_connection()
 
