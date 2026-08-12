@@ -1,4 +1,7 @@
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -6,6 +9,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.core.rate_limit import limiter
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # --- 1. CORE IMPORTS ---
 from app.core.database import engine, Base
@@ -56,6 +61,73 @@ app.add_middleware(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- SECURITY HEADERS ---
+# Swagger UI loads swagger-ui-bundle.js and swagger-ui.css from cdn.jsdelivr.net,
+# so a "default-src 'self'" policy renders /docs as a blank page. These three are
+# a developer tool with no user data on them, so they are the one place the policy
+# is skipped - every actual API response still gets it.
+DOCS_PATHS = {"/docs", "/redoc", "/openapi.json"}
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """
+    Stamps the baseline security headers onto every response.
+
+    Registered AFTER the CORS middleware on purpose: add_middleware inserts at the
+    front of the stack, so whatever is added last ends up outermost. That means
+    CORS preflight responses get these headers too.
+    """
+    response = await call_next(request)
+
+    # 1. Never let a browser second-guess the declared content type, and never
+    #    allow the API to be framed.
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+
+    # 2. HSTS only when the request genuinely arrived over TLS. Browsers ignore
+    #    this header on plain HTTP anyway, but the Vite dev server proxies /api
+    #    over HTTPS and would hand it straight to the browser. HSTS is keyed by
+    #    host and ignores the port, so that would pin *localhost* to HTTPS for a
+    #    year and break every other http://localhost project on the machine.
+    is_https = (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto") == "https"
+    )
+    if is_https:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+    # 3. The API only ever answers with JSON, so nothing legitimate needs to load
+    #    from anywhere else.
+    if request.url.path not in DOCS_PATHS:
+        response.headers["Content-Security-Policy"] = "default-src 'self';"
+
+    return response
+
+
+# --- GLOBAL ERROR HANDLER ---
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Turns any unhandled crash into a generic 500 instead of a stack trace.
+
+    Without this the client receives the raw exception, which for a database error
+    means the SQL statement and often the connection details along with it.
+
+    Only genuinely unhandled errors reach here. FastAPI routes HTTPException and
+    RequestValidationError to their own handlers further down the stack, so the
+    existing 400/403/404 responses - and slowapi's 429 - are untouched.
+
+    logger.exception is the whole point of the function: the traceback still has to
+    reach the server log, it just must not reach the client.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again later."},
+    )
 
 # --- STATIC FILES (Profile pictures) ---
 # Mounted under /api on purpose: the Vite dev server runs on HTTPS and already

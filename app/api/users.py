@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from app.api.dependencies import RequireRole, get_current_user_id
+from app.api.dependencies import get_current_admin, get_current_user_id
 import jwt
 
 from app.core.rate_limit import limiter
@@ -17,16 +17,12 @@ PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest,
 UserProfileUpdate, UserProfileResponse)
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.config import settings
-from app.api.dependencies import RequireRole
 from app.services.email import create_action_token, send_verification_email, send_password_reset_email
 from app.services.recaptcha import verify_recaptcha
 from app.services.storage import save_avatar, delete_avatar
 
 
 router = APIRouter()
-
-# BOUNCER
-get_current_admin = RequireRole("admin")
 
 
 @router.post("/", response_model=UserResponse)
@@ -199,8 +195,6 @@ async def login(
 
     # We no longer need to return the token in the JSON body
     return {"message": "Successfully logged in"}
-
-get_current_admin = RequireRole("admin")
 
 
 @router.get("/me", response_model=UserResponse)
