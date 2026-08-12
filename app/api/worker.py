@@ -12,39 +12,12 @@ from app.models.user import User, Role
 from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.api.dependencies import RequireRole
+from app.api.helpers import build_like_pattern, full_name
 
 router = APIRouter()
 
 # Bouncer for the desk worker role
 get_current_worker = RequireRole("worker")
-
-
-def _build_like_pattern(raw: str) -> str:
-    """
-    Turns what the worker typed into a safe 'contains' LIKE pattern.
-
-    '%' and '_' are wildcards in SQL. Without escaping them, a worker typing a
-    single '%' would match every user in the database, which is both a useless
-    result and a needless full table scan. The backslash itself goes first,
-    otherwise we would escape the escapes we just added.
-    """
-    escaped = raw.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
-
-
-def _full_name(user: User | None) -> str:
-    """
-    Builds a display name that survives missing data.
-
-    first_name and last_name are nullable, so an account created with nothing but
-    an email would otherwise render as the literal string "None None" on the desk
-    panel. Falls back to a placeholder rather than an empty string, so a row never
-    looks like a rendering bug to the worker reading it.
-    """
-    if user is None:
-        return "Unknown user"
-
-    return f"{user.first_name or ''} {user.last_name or ''}".strip() or "Unknown user"
 
 
 @router.get("/search")
@@ -64,7 +37,7 @@ async def search_users(
     addresses to anyone on the desk - and without is_active it offers accounts
     that were deactivated precisely so they could not get through the door.
     """
-    pattern = _build_like_pattern(query)
+    pattern = build_like_pattern(query)
 
     # The fourth condition matches against "first last" as one string, so typing
     # a full name finds the person. SQLAlchemy renders '+' on String columns as
@@ -93,7 +66,7 @@ async def search_users(
     return [
         {
             "user_id": user.id,
-            "full_name": _full_name(user),
+            "full_name": full_name(user),
             "email": user.email,
         }
         for user in users
@@ -158,7 +131,7 @@ async def manual_entry_override(
 
     return {
         "status": "success",
-        "message": f"DOOR OPENED! User {_full_name(target_user)} was let in by worker ID {worker_id}",
+        "message": f"DOOR OPENED! User {full_name(target_user)} was let in by worker ID {worker_id}",
         "log_id": entry_log.id
     }
 
@@ -201,7 +174,7 @@ async def check_user_status(
     if not active_sub_record:
         return {
             "user_id": user.id,
-            "full_name": _full_name(user),
+            "full_name": full_name(user),
             "email": user.email,
             "has_active_subscription": False,
             "message": "User DOES NOT have an active subscription! Do not let them in."
@@ -215,7 +188,7 @@ async def check_user_status(
 
     return {
         "user_id": user.id,
-        "full_name": _full_name(user),
+        "full_name": full_name(user),
         "email": user.email,
         "has_active_subscription": True,
         "plan_name": plan_name,
@@ -292,7 +265,7 @@ async def get_currently_inside(
     for log in active_logs:
         items.append({
             "user_id": log.user.id,
-            "full_name": _full_name(log.user),
+            "full_name": full_name(log.user),
             "email": log.user.email,
             "entered_at": log.timestamp
         })
@@ -336,7 +309,7 @@ async def get_recent_logs(
         items.append({
             "id": log.id,
             "user_id": log.user_id,
-            "full_name": _full_name(log.user),
+            "full_name": full_name(log.user),
             "action_type": log.action_type,
             "access_granted": log.access_granted,
             "reason": log.reason,

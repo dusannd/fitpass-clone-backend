@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     SMTP_USER: Optional[str] = None
     SMTP_PASS: Optional[str] = None
 
+    # --- LOCAL TIME ---
+    # The gym's wall clock. Timestamps are stored in UTC, so anything an admin
+    # reads as a time of day - peak hours, "today", the weekly breakdown - has to
+    # be converted into this zone first, or a 01:30 visit is reported as having
+    # happened the previous evening.
+    GYM_TIMEZONE: str = "Europe/Belgrade"
+
     TESTING: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
