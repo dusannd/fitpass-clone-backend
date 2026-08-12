@@ -105,7 +105,12 @@ async def create_user(
 
     # <--- 2. USE BACKGROUND_TASKS.ADD_TASK INSTEAD OF AWAIT --->
     # The server will return the response immediately and run this function in the background.
-    background_tasks.add_task(send_verification_email, created_user.email, verification_token)
+    # The first name is read here and passed as a plain string. add_task evaluates its
+    # arguments immediately, so nothing hands the ORM object itself to the background
+    # task - by the time that runs, the session is closed and the instance detached.
+    background_tasks.add_task(
+        send_verification_email, created_user.email, verification_token, created_user.first_name
+    )
 
     return created_user
 
@@ -382,8 +387,11 @@ async def resend_verification(
     # We only trigger the email if the user exists AND they are NOT verified yet.
     if user and not user.is_verified:
         verification_token = create_action_token(user.email, "verify_email")
-        # Send the email in the background so the endpoint returns instantly
-        background_tasks.add_task(send_verification_email, user.email, verification_token)
+        # Send the email in the background so the endpoint returns instantly.
+        # The name goes as a plain string, not the ORM object - see /register above.
+        background_tasks.add_task(
+            send_verification_email, user.email, verification_token, user.first_name
+        )
 
     # 3. Always return a 200 OK with the same message, regardless of whether the email exists.
     return {

@@ -22,7 +22,7 @@ SQLALCHEMY_TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 engine_test = create_async_engine(
     SQLALCHEMY_TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool, 
+    poolclass=StaticPool,
 )
 
 TestingSessionLocal = async_sessionmaker(
