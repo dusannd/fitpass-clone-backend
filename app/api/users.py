@@ -435,19 +435,33 @@ async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/forgot-password")
-async def forgot_password(request: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("3/15minutes")
+async def forgot_password(
+    request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    payload: PasswordResetRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Public Route: User requests a password reset link.
+    Rate limited to 3 requests per 15 minutes - without one, the enumeration
+    below can simply be run as a wordlist at full speed.
     """
-    result = await db.execute(select(User).where(User.email == request.email))
+    # 1. Look up the user by email
+    result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()
 
-    # SECURITY BEST PRACTICE: Always return a generic success message
-    # even if the email doesn't exist, to prevent hackers from "email guessing"
+    # 2. Security: the response never says whether the email exists. That only
+    # holds if the RESPONSE TIME says nothing either - this used to await the
+    # send, which in production is a live HTTPS round trip to Resend. A known
+    # address took a few hundred milliseconds, an unknown one a few, and the
+    # generic message below could be defeated with a stopwatch.
+    # Queueing the mail makes both branches return at the same speed.
     if user:
         reset_token = create_action_token(user.email, "reset_password")
-        await send_password_reset_email(user.email, reset_token)
+        background_tasks.add_task(send_password_reset_email, user.email, reset_token)
 
+    # 3. Always the same body, whether or not the account exists.
     return {"message": "If that email is registered, a password reset link has been sent."}
 
 
