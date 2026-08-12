@@ -1,14 +1,16 @@
 import pytest
+import uuid
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.pool import StaticPool # <--- DODAJ OVO
+from sqlalchemy.pool import StaticPool
 from app.core.database import Base, get_db
 from app.main import app
 from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.models.coaching import Appointment
 from app.models.access import EntryLog
+from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.user import User, Role
 
 limiter.enabled = False
@@ -20,7 +22,7 @@ SQLALCHEMY_TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 engine_test = create_async_engine(
     SQLALCHEMY_TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool, # <--- DODAJ OVO DA BAZA PREZIVI SVE REKVESTE
+    poolclass=StaticPool, 
 )
 
 TestingSessionLocal = async_sessionmaker(
@@ -112,6 +114,59 @@ def seed_entry_logs():
 
             await session.commit()
         return created_ids
+
+    return _seed
+
+
+@pytest.fixture
+def seed_subscription():
+    """
+    Writes a UserSubscription row straight into the database.
+
+    The only path that creates one in production is a Stripe webhook carrying a
+    signed payload, so a test cannot reach this state over HTTP at all.
+
+    stripe_subscription_id is explicit because None is a state worth testing: rows
+    that predate the Stripe integration, and passes the desk activates by hand,
+    both have no Stripe subscription behind them and therefore no billing portal.
+
+    A plan is created on demand when none is passed - the FK needs a real one, and
+    the in-memory database is shared across the whole session, so the name gets a
+    uuid suffix rather than colliding with test_plans.py.
+
+    Lives here rather than in a test module for the same reason as the fixtures
+    above: test/ has no __init__.py, so it is not importable as a package.
+    """
+    async def _seed(
+        user_id: int,
+        plan_id: int | None = None,
+        stripe_subscription_id: str | None = "sub_test_123",
+        days_left: int = 30,
+        is_active: int = 1,
+    ):
+        async with TestingSessionLocal() as session:
+            if plan_id is None:
+                plan = SubscriptionPlan(
+                    name=f"Seeded Plan {uuid.uuid4().hex[:6]}",
+                    description="Created by seed_subscription",
+                    price=3000,
+                    duration_days=30,
+                )
+                session.add(plan)
+                await session.flush()
+                plan_id = plan.id
+
+            subscription = UserSubscription(
+                user_id=user_id,
+                plan_id=plan_id,
+                start_date=datetime.now(timezone.utc) - timedelta(days=1),
+                end_date=datetime.now(timezone.utc) + timedelta(days=days_left),
+                is_active=is_active,
+                stripe_subscription_id=stripe_subscription_id,
+            )
+            session.add(subscription)
+            await session.commit()
+            return subscription.id
 
     return _seed
 

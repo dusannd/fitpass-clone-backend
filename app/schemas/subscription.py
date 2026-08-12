@@ -156,4 +156,9 @@ class MySubscriptionResponse(BaseModel):
     is_active: int
     plan: PlanResponse
 
+    # Lets the member UI tell a Stripe-backed subscription from a legacy/manual one.
+    # The billing portal only exists for the former, so the "Manage Subscription"
+    # button can hide itself instead of always coming back with a 400.
+    stripe_subscription_id: Optional[str] = None
+
     model_config = ConfigDict(from_attributes=True)

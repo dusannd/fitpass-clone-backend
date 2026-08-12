@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_
+from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
 
 from app.core.database import get_db
@@ -94,6 +95,77 @@ async def create_checkout_session(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/customer-portal")
+async def create_customer_portal_session(
+        db: AsyncSession = Depends(get_db),
+        user_id: int = Depends(get_current_user_id)
+):
+    """
+    Creates a Stripe Billing Portal session for the caller's active subscription.
+
+    The portal is Stripe's own hosted page: cancelling, swapping the card on file
+    and downloading invoices all happen there, so we never handle card data.
+    Returns the one-time URL the frontend redirects to.
+    """
+    # 1. Find the caller's active subscription. Same ordering as
+    #    GET /subscriptions/my-subscription so both endpoints agree on which row
+    #    is "the" active one if a user somehow ends up holding two.
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(UserSubscription)
+        .where(
+            and_(
+                UserSubscription.user_id == user_id,
+                UserSubscription.is_active == 1,
+                UserSubscription.end_date > now
+            )
+        )
+        .order_by(UserSubscription.end_date.desc())
+    )
+    active_sub = result.scalars().first()
+
+    if not active_sub:
+        raise HTTPException(
+            status_code=400,
+            detail="You don't have an active subscription to manage."
+        )
+
+    # 2. Legacy rows (and anything the desk activated by hand) have no Stripe
+    #    subscription behind them, so there is no portal to send them to.
+    if not active_sub.stripe_subscription_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This subscription wasn't created through Stripe, so it can't be managed online."
+        )
+
+    try:
+        # 3. We don't store stripe_customer_id, so read it off the subscription.
+        #    Both Stripe calls go through run_in_threadpool: the SDK is synchronous
+        #    `requests` under the hood, and calling it bare inside an async route
+        #    blocks the entire event loop for two network round trips.
+        stripe_sub = await run_in_threadpool(
+            stripe.Subscription.retrieve, active_sub.stripe_subscription_id
+        )
+        customer_id = stripe_sub.customer
+
+        # 4. Mint the session. return_url is where Stripe's "Back to..." link goes.
+        portal_session = await run_in_threadpool(
+            lambda: stripe.billing_portal.Session.create(
+                customer=customer_id,
+                return_url=f"{settings.FRONTEND_URL}/subscriptions"
+            )
+        )
+    except stripe.StripeError:
+        # Stripe being unreachable is an upstream failure, not a bug on our side -
+        # a 502 says that honestly and keeps it out of our 5xx error budget.
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Stripe right now. Please try again in a moment."
+        )
+
+    return {"url": portal_session.url}
 
 
 @router.post("/webhook")
