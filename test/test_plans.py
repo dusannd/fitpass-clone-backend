@@ -79,7 +79,14 @@ async def test_invalid_tier_is_rejected(admin_client):
         assert res.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["name", "price", "duration_days", "tier"])
+@pytest.mark.parametrize("field", [
+    "name", "price", "duration_days", "tier",
+    # The perk flags are NOT NULL columns too. A null here is the more tempting
+    # mistake, because it reads like "turn this perk off" - sending false is how
+    # that is done.
+    "includes_trainer", "includes_group_classes",
+    "has_sauna_access", "has_towel_service", "allows_guest",
+])
 @pytest.mark.asyncio
 async def test_explicit_null_is_rejected(admin_client, field):
     """
@@ -153,3 +160,127 @@ async def test_tier_can_be_updated(admin_client):
         # exclude_unset means an omitted field is left alone, not nulled
         assert res_put.json()["description"] == "Keep me"
         assert res_put.json()["price"] == 2000
+
+
+# ==========================================
+# PLAN PERKS
+# ==========================================
+# What a membership actually includes, as opposed to how its card is styled.
+# tier is decoration; these five are the reason an expensive plan is worth more.
+
+PERKS = [
+    "includes_trainer",
+    "includes_group_classes",
+    "has_sauna_access",
+    "has_towel_service",
+    "allows_guest",
+]
+
+
+@pytest.mark.asyncio
+async def test_perks_round_trip(admin_client):
+    """
+    Perks ticked at creation come back on the response AND survive a re-read.
+
+    The re-read is the point: an endpoint that echoed the request body back would
+    pass the first assertion while having stored nothing.
+    """
+    async with admin_client as ac:
+        res = await ac.post("/api/subscriptions/plans", json={
+            "name": f"Loaded {uuid.uuid4().hex[:6]}",
+            "price": 4500,
+            "duration_days": 30,
+            "tier": "VIP",
+            **{perk: True for perk in PERKS},
+        })
+
+        assert res.status_code == 200
+        assert all(res.json()[perk] is True for perk in PERKS)
+        plan_id = res.json()["id"]
+
+        res_all = await ac.get("/api/subscriptions/plans/all")
+        stored = next(p for p in res_all.json() if p["id"] == plan_id)
+        assert all(stored[perk] is True for perk in PERKS)
+
+
+@pytest.mark.asyncio
+async def test_perks_default_to_false(admin_client):
+    """
+    A plan created without any perks reads back as false, never null.
+
+    Null is what would happen with a column added nullable and unbackfilled - the
+    mistake is_active on this same table already made, and the reason PlanResponse
+    still carries a validator for it.
+    """
+    async with admin_client as ac:
+        res = await ac.post("/api/subscriptions/plans", json={
+            "name": f"Bare {uuid.uuid4().hex[:6]}",
+            "price": 1500,
+            "duration_days": 30,
+        })
+
+        assert res.status_code == 200
+        for perk in PERKS:
+            assert res.json()[perk] is False, f"{perk} should default to False"
+
+
+@pytest.mark.asyncio
+async def test_perk_can_be_toggled_off(admin_client):
+    """
+    Turning a perk off is a real edit the admin panel makes, and false must not be
+    mistaken for "not supplied" on the way through exclude_unset.
+    """
+    async with admin_client as ac:
+        res = await ac.post("/api/subscriptions/plans", json={
+            "name": f"Downgrade {uuid.uuid4().hex[:6]}",
+            "description": "Keep me",
+            "price": 4500,
+            "duration_days": 30,
+            "tier": "VIP",
+            "includes_trainer": True,
+            "has_sauna_access": True,
+        })
+        plan_id = res.json()["id"]
+
+        res_put = await ac.put(
+            f"/api/subscriptions/plans/{plan_id}", json={"includes_trainer": False}
+        )
+
+        assert res_put.status_code == 200
+        assert res_put.json()["includes_trainer"] is False
+        # The perk that was not mentioned is left exactly as it was.
+        assert res_put.json()["has_sauna_access"] is True
+        assert res_put.json()["description"] == "Keep me"
+
+        # And it really is on the row, not just in the reply.
+        res_all = await ac.get("/api/subscriptions/plans/all")
+        stored = next(p for p in res_all.json() if p["id"] == plan_id)
+        assert stored["includes_trainer"] is False
+        assert stored["has_sauna_access"] is True
+
+
+@pytest.mark.asyncio
+async def test_perks_reach_the_public_pricing_endpoint(admin_client):
+    """
+    GET /plans is what the member pricing cards read, and it is a different query
+    from the admin listing - the perks have to be on that response too or the
+    cards have nothing to tick.
+    """
+    async with admin_client as ac:
+        res = await ac.post("/api/subscriptions/plans", json={
+            "name": f"Public {uuid.uuid4().hex[:6]}",
+            "price": 4500,
+            "duration_days": 30,
+            "tier": "VIP",
+            "includes_trainer": True,
+            "allows_guest": True,
+        })
+        plan_id = res.json()["id"]
+
+        res_public = await ac.get("/api/subscriptions/plans")
+
+        assert res_public.status_code == 200
+        listed = next(p for p in res_public.json() if p["id"] == plan_id)
+        assert listed["includes_trainer"] is True
+        assert listed["allows_guest"] is True
+        assert listed["has_towel_service"] is False

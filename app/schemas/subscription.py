@@ -60,6 +60,15 @@ class PlanCreate(BaseModel):
     price: float = Field(..., ge=0, description="Price must be 0 or greater")
     duration_days: int = Field(default=30, gt=0, description="Duration must be at least 1 day")
     tier: PlanTier = "Standard"
+
+    # Perks default to False so an older client that knows nothing about them
+    # creates a bare plan rather than a 422.
+    includes_trainer: bool = False
+    includes_group_classes: bool = False
+    has_sauna_access: bool = False
+    has_towel_service: bool = False
+    allows_guest: bool = False
+
     location_ids: List[int] = []
     rule: Optional[RuleCreate] = None
 
@@ -74,7 +83,17 @@ class PlanUpdate(BaseModel):
     duration_days: Optional[int] = Field(None, gt=0, description="Duration must be at least 1 day")
     tier: Optional[PlanTier] = None
 
-    @field_validator("name", "price", "duration_days", "tier")
+    includes_trainer: Optional[bool] = None
+    includes_group_classes: Optional[bool] = None
+    has_sauna_access: Optional[bool] = None
+    has_towel_service: Optional[bool] = None
+    allows_guest: Optional[bool] = None
+
+    @field_validator(
+        "name", "price", "duration_days", "tier",
+        "includes_trainer", "includes_group_classes",
+        "has_sauna_access", "has_towel_service", "allows_guest",
+    )
     @classmethod
     def reject_explicit_null(cls, v):
         """
@@ -87,6 +106,10 @@ class PlanUpdate(BaseModel):
         duration_days is worse: its column IS nullable, so the write succeeds, but
         PlanResponse.duration_days is a plain int, which means every later read of
         that plan fails response validation. One bad request would poison the row.
+
+        The five perk flags are NOT NULL columns too, and a null there is the more
+        dangerous kind of mistake: it reads like "clear this perk" but would in fact
+        be an IntegrityError. Sending false is how a perk is turned off.
 
         Omitting a field is how you leave it unchanged, so a null here is always a
         client mistake and deserves a 422.
@@ -112,6 +135,16 @@ class PlanResponse(BaseModel):
     # Typed as a plain str, not PlanTier, so a row holding an unexpected value still
     # serializes instead of 500-ing. The frontend falls back to the Standard theme.
     tier: str
+
+    # No mode="before" validator on these, unlike is_active and tier above: the
+    # perk columns are NOT NULL with a server_default from the very first
+    # migration that adds them, so a NULL row cannot exist to begin with.
+    includes_trainer: bool = False
+    includes_group_classes: bool = False
+    has_sauna_access: bool = False
+    has_towel_service: bool = False
+    allows_guest: bool = False
+
     locations: List[GymLocationResponse] = []
     rule: Optional[RuleResponse] = None
 

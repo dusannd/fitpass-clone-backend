@@ -143,6 +143,7 @@ def seed_subscription():
         stripe_subscription_id: str | None = "sub_test_123",
         days_left: int = 30,
         is_active: int = 1,
+        includes_trainer: bool = False,
     ):
         async with TestingSessionLocal() as session:
             if plan_id is None:
@@ -151,6 +152,10 @@ def seed_subscription():
                     description="Created by seed_subscription",
                     price=3000,
                     duration_days=30,
+                    # The one perk the backend enforces. Defaults to False so every
+                    # existing caller keeps the plan it always got; coaching tests
+                    # ask for True explicitly.
+                    includes_trainer=includes_trainer,
                 )
                 session.add(plan)
                 await session.flush()
@@ -169,6 +174,27 @@ def seed_subscription():
             return subscription.id
 
     return _seed
+
+
+@pytest.fixture
+def expire_subscription():
+    """
+    Deactivates an existing subscription, the way losing a pass really happens.
+
+    In production this is done by Stripe's customer.subscription.deleted webhook
+    (app/api/payments.py) or by the hourly sweep in app/services/scheduler.py -
+    neither of which a test can reach over HTTP without a signed Stripe payload.
+
+    Takes the id returned by seed_subscription, so a test can set a member up with
+    a perk, use it, and then take it away without touching the plan itself.
+    """
+    async def _expire(subscription_id: int):
+        async with TestingSessionLocal() as session:
+            subscription = await session.get(UserSubscription, subscription_id)
+            subscription.is_active = 0
+            await session.commit()
+
+    return _expire
 
 
 @pytest.fixture

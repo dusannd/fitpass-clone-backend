@@ -11,7 +11,7 @@ async def override_get_current_admin():
 
 
 @pytest.mark.asyncio
-async def test_private_workout_plans_security_and_visibility():
+async def test_private_workout_plans_security_and_visibility(seed_subscription):
     """
     INTEGRATION TEST (Private Workout Plans):
     Verifies that a trainer can only create private plans for active clients,
@@ -56,6 +56,10 @@ async def test_private_workout_plans_security_and_visibility():
         client_b_id = res.json()["id"]
 
         # --- 2. LINK TRAINER AND CLIENT A ---
+        # Coaching needs a plan that includes personal training. Client B is left
+        # without one on purpose - they stay unaffiliated either way.
+        await seed_subscription(client_a_id, includes_trainer=True)
+
         # Client A requests coaching
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_a_headers)
 
@@ -105,7 +109,7 @@ async def test_private_workout_plans_security_and_visibility():
 
 
 @pytest.mark.asyncio
-async def test_member_can_remove_plans_from_their_library():
+async def test_member_can_remove_plans_from_their_library(seed_subscription):
     """
     INTEGRATION TEST (Removing plans):
     A member can unfollow a public plan they saved, and hide a plan their trainer
@@ -145,7 +149,10 @@ async def test_member_can_remove_plans_from_their_library():
         res = await ac.post("/api/users/login", json={"email": outsider_email, "password": password})
         outsider_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
-        # Link the trainer and the client so private plans are allowed
+        # Link the trainer and the client so private plans are allowed. That needs a
+        # plan including personal training first.
+        await seed_subscription(client_id, includes_trainer=True)
+
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
         res_reqs = await ac.get("/api/coaching/requests", headers=trainer_headers)
         request_id = res_reqs.json()[0]["id"]

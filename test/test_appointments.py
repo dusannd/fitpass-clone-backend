@@ -12,7 +12,7 @@ async def override_get_current_admin():
 
 
 @pytest.mark.asyncio
-async def test_appointment_scheduling_flow(backdate_appointment):
+async def test_appointment_scheduling_flow(backdate_appointment, seed_subscription):
     """
     INTEGRATION TEST (Appointments):
     1. Register Trainer and Client.
@@ -51,6 +51,10 @@ async def test_appointment_scheduling_flow(backdate_appointment):
         client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
         # --- 2. LINK TRAINER AND CLIENT ---
+        # Coaching needs a plan that includes personal training, so the client is
+        # given one first. This test is about the appointment rules, not the perk.
+        await seed_subscription(client_id, includes_trainer=True)
+
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
         res_reqs = await ac.get("/api/coaching/requests", headers=trainer_headers)
         request_id = res_reqs.json()[0]["id"]
@@ -106,7 +110,7 @@ async def test_appointment_scheduling_flow(backdate_appointment):
 
 
 @pytest.mark.asyncio
-async def test_cancelling_a_future_session_is_allowed():
+async def test_cancelling_a_future_session_is_allowed(seed_subscription):
     """
     The COMPLETED guard must not leak into CANCELLED: cancelling a session that
     hasn't happened yet is the normal, expected case.
@@ -132,10 +136,14 @@ async def test_cancelling_a_future_session_is_allowed():
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
         trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
-        await ac.post("/api/users/",
-                      json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        res = await ac.post("/api/users/",
+                            json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        client_id = res.json()["id"]
         res = await ac.post("/api/users/login", json={"email": client_email, "password": password})
         client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+        # Coaching needs a plan that includes personal training.
+        await seed_subscription(client_id, includes_trainer=True)
 
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
         res_reqs = await ac.get("/api/coaching/requests", headers=trainer_headers)
@@ -162,7 +170,7 @@ async def test_cancelling_a_future_session_is_allowed():
 
 
 @pytest.mark.asyncio
-async def test_status_change_preserves_existing_notes(backdate_appointment):
+async def test_status_change_preserves_existing_notes(backdate_appointment, seed_subscription):
     """
     Feedback is shown to the member as "Trainer's Note", so a later status change
     must not erase it. Omitting the key leaves it; an explicit null clears it.
@@ -188,10 +196,14 @@ async def test_status_change_preserves_existing_notes(backdate_appointment):
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
         trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
-        await ac.post("/api/users/",
-                      json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        res = await ac.post("/api/users/",
+                            json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        client_id = res.json()["id"]
         res = await ac.post("/api/users/login", json={"email": client_email, "password": password})
         client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+        # Coaching needs a plan that includes personal training.
+        await seed_subscription(client_id, includes_trainer=True)
 
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
         res_reqs = await ac.get("/api/coaching/requests", headers=trainer_headers)
@@ -233,7 +245,7 @@ async def test_status_change_preserves_existing_notes(backdate_appointment):
 
 
 @pytest.mark.asyncio
-async def test_booking_horizon_is_enforced():
+async def test_booking_horizon_is_enforced(seed_subscription):
     """
     A member must not be able to park a slot years out. 60 days is the cap, so a
     booking 61 days ahead is rejected while one inside the window succeeds.
@@ -259,10 +271,14 @@ async def test_booking_horizon_is_enforced():
         res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
         trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
 
-        await ac.post("/api/users/",
-                      json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        res = await ac.post("/api/users/",
+                            json={"email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        client_id = res.json()["id"]
         res = await ac.post("/api/users/login", json={"email": client_email, "password": password})
         client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+        # Coaching needs a plan that includes personal training.
+        await seed_subscription(client_id, includes_trainer=True)
 
         await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
         res_reqs = await ac.get("/api/coaching/requests", headers=trainer_headers)

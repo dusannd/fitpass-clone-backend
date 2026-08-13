@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from app.core.database import get_db
 from app.api.dependencies import RequireRole
 from app.models.coaching import TrainerClientLink, Appointment
+from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.user import User, Role
 from app.models.workout import WorkoutSession, ExerciseLog
 from app.schemas.coaching import CoachingRequestUpdate, TrainerClientLinkResponse, AppointmentCreate, AppointmentUpdate, AppointmentResponse
@@ -23,6 +24,47 @@ get_current_trainer = RequireRole("trainer")
 # How far ahead a member is allowed to book. Keeps a trainer's calendar plannable
 # and stops somebody parking a slot years out.
 MAX_BOOKING_HORIZON_DAYS = 60
+
+
+async def require_trainer_entitlement(db: AsyncSession, user_id: int) -> None:
+    """
+    Raise 403 unless the caller's active plan includes personal training.
+
+    Coaching used to be open to every member, including members holding no
+    subscription at all - this file contained no subscription check whatsoever.
+    That is what made an expensive plan indistinguishable from the cheapest one.
+
+    Only the boolean column is selected, not the ORM objects. Nothing here is
+    serialized into a response, so there is no relationship to eager-load and no
+    MissingGreenlet to trip over.
+
+    The subscription is picked newest-first with id as a tiebreaker. There should
+    only ever be one active row - payments.py refuses a second - but now that
+    plans grant different things, "whichever row the database returned first"
+    stops being a harmless detail.
+    """
+    stmt = (
+        select(SubscriptionPlan.includes_trainer)
+        .join(UserSubscription, UserSubscription.plan_id == SubscriptionPlan.id)
+        .where(
+            UserSubscription.user_id == user_id,
+            UserSubscription.is_active == 1,
+            UserSubscription.end_date > datetime.now(timezone.utc),
+        )
+        .order_by(UserSubscription.end_date.desc(), UserSubscription.id.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    includes_trainer = result.scalars().first()
+
+    # None means no active subscription, False means a plan that does not include
+    # it. Both get the same answer - the member is told what to do about it either
+    # way, and the difference is none of the caller's business.
+    if not includes_trainer:
+        raise HTTPException(
+            status_code=403,
+            detail="Your membership does not include personal training. Upgrade your plan to book a trainer."
+        )
 
 
 def as_utc(value: datetime) -> datetime:
@@ -48,7 +90,14 @@ async def request_coaching(
 ):
     """
     Member Route: Send a 1-on-1 coaching request to a specific trainer.
+
+    Requires an active plan carrying the personal-training perk.
     """
+    # 0. The membership has to include a trainer at all. Checked first so a member
+    #    without the perk gets one clear answer, rather than a 404 about a trainer
+    #    they were never allowed to reach.
+    await require_trainer_entitlement(db, client_id)
+
     # 1. Verify if the target user is actually a trainer
     stmt = select(User).join(User.roles).where(User.id == trainer_id, Role.name == "trainer")
     result = await db.execute(stmt)
@@ -254,6 +303,15 @@ async def schedule_appointment(
             status_code=403,
             detail="You can only schedule appointments with trainers who have accepted your request."
         )
+
+    # 5b. The membership must still include personal training.
+    #
+    # Checked here as well as on the request, and deliberately AFTER the link check
+    # above: without it a member links to a trainer while on a plan that includes
+    # one, drops to the cheapest plan, and keeps booking sessions forever. The link
+    # itself is left alone - nobody's existing trainer or booked session is torn up,
+    # they simply cannot book another until the plan covers it again.
+    await require_trainer_entitlement(db, client_id)
 
     # 6. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
     # Overlap logic: (NewStart < ExistingEnd) AND (NewEnd > ExistingStart)

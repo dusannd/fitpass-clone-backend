@@ -198,6 +198,13 @@ async def scan_qr_code(
                 )
             )
             .distinct()
+            # Newest pass first, with id as the tiebreaker. This used to take
+            # .first() off an unordered query, so WHICH plan's locations and hours
+            # were applied at the door was whatever the database happened to return.
+            # payments.py refuses a second concurrent subscription, so it should
+            # never matter - but now that plans genuinely grant different things,
+            # an arbitrary pick is a door that opens on some scans and not others.
+            .order_by(UserSubscription.end_date.desc(), UserSubscription.id.desc())
         )
         result = await db.execute(stmt)
         active_sub = result.scalars().first()
