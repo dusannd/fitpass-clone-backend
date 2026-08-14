@@ -168,6 +168,32 @@ async def create_customer_portal_session(
     return {"url": portal_session.url}
 
 
+def extract_subscription_id(invoice) -> str | None:
+    """
+    Digs the Stripe subscription id out of an invoice object.
+
+    Newer Stripe API versions nest it under
+    `parent.subscription_details.subscription` instead of the legacy top-level
+    `subscription` field, so we fall back between the two.
+
+    A function rather than two copies of the ladder: it exists precisely because
+    Stripe has already moved this field once, and when they move it again there
+    should be one place to change. Both the payment_succeeded and the
+    payment_failed branch read it.
+
+    getattr throughout, never .get - a stripe.StripeObject is not a dict subclass
+    in stripe-python 15.x and has no .get at all.
+    """
+    subscription_id = getattr(invoice, "subscription", None)
+    if subscription_id:
+        return subscription_id
+
+    parent = getattr(invoice, "parent", None)
+    nested_details = getattr(parent, "subscription_details", None) if parent else None
+
+    return getattr(nested_details, "subscription", None) if nested_details else None
+
+
 @router.post("/webhook")
 async def stripe_webhook(
         request: Request,
@@ -195,14 +221,7 @@ async def stripe_webhook(
     if event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
 
-        # Extract the subscription's Stripe ID. Newer Stripe API versions nest this
-        # under `parent.subscription_details.subscription` instead of the legacy
-        # top-level `subscription` field, so we fall back between the two.
-        stripe_subscription_id = getattr(invoice, "subscription", None)
-        if not stripe_subscription_id:
-            parent = getattr(invoice, "parent", None)
-            nested_details = getattr(parent, "subscription_details", None) if parent else None
-            stripe_subscription_id = getattr(nested_details, "subscription", None) if nested_details else None
+        stripe_subscription_id = extract_subscription_id(invoice)
 
         # The first (and only, for our single-item checkout) invoice line item.
         # Used both as a metadata fallback below and as the source of truth for
@@ -219,7 +238,13 @@ async def stripe_webhook(
         metadata = getattr(subscription_details, "metadata", None) if subscription_details else None
 
         if not metadata and first_line:
-            metadata = first_line.get("metadata")
+            # getattr, NOT .get(). A line item is a stripe.StripeObject, which as of
+            # stripe-python 15.x is not a dict subclass and has no .get - calling it
+            # raises AttributeError, which turns this whole webhook into a 500 and
+            # means the member's subscription row never gets created at all. The
+            # failure is invisible until it happens, because this branch only runs
+            # when invoice.subscription_details is absent.
+            metadata = getattr(first_line, "metadata", None)
 
         # IDEMPOTENCY: Stripe can (and does) redeliver the same webhook event on
         # network retries. Incrementing end_date by a duration would double-grant
@@ -269,6 +294,42 @@ async def stripe_webhook(
                     )
                     db.add(new_sub)
 
+                await db.commit()
+
+    elif event['type'] == 'invoice.payment_failed':
+        # A recurring charge was refused. Until now nothing reacted to this at all,
+        # so a member whose card stopped working kept full turnstile access until
+        # Stripe eventually gave up and fired customer.subscription.deleted - weeks
+        # of free training.
+        #
+        # Revoking on the FIRST failure is deliberate, and it is safe because it
+        # heals itself: Stripe retries a failed invoice on its dunning schedule, and
+        # the payment_succeeded branch above sets is_active back to 1 on the row it
+        # finds. So a member whose card merely hiccuped is let back in automatically
+        # the moment the retry clears, with nobody at the desk having to do anything.
+        #
+        # Known limitation, worth writing down rather than rediscovering: webhooks
+        # are NOT ordered. A payment_failed for an earlier attempt can arrive after
+        # the retry's payment_succeeded and revoke a member who is actually paid up.
+        # The next successful invoice restores them, and guarding against it would
+        # cost a Stripe round-trip on every failure, so we accept it.
+        invoice = event['data']['object']
+        stripe_subscription_id = extract_subscription_id(invoice)
+
+        if stripe_subscription_id:
+            result = await db.execute(
+                select(UserSubscription).where(
+                    UserSubscription.stripe_subscription_id == stripe_subscription_id
+                )
+            )
+            user_sub = result.scalars().first()
+
+            # No row for this subscription is not an error - it may belong to
+            # another environment sharing the same Stripe account. Falling through
+            # to the 200 below stops Stripe retrying something we will never handle.
+            if user_sub:
+                user_sub.is_active = 0
+                db.add(user_sub)
                 await db.commit()
 
     elif event['type'] == 'customer.subscription.deleted':

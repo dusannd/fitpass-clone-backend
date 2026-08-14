@@ -219,6 +219,64 @@ def plan_location_ids():
 
 
 @pytest.fixture
+def subscription_by_stripe_id():
+    """
+    Reads a UserSubscription back by its Stripe id, or None when there is none.
+
+    The Stripe webhook is the only thing that writes these rows in production, and
+    it answers 200 no matter what it did, so asserting on the response body proves
+    nothing at all - the row itself is the only evidence. Returns a plain dict so
+    the caller is not holding a detached ORM object after the session closes.
+    """
+    async def _read(stripe_subscription_id: str) -> dict | None:
+        async with TestingSessionLocal() as session:
+            result = await session.execute(
+                select(UserSubscription).where(
+                    UserSubscription.stripe_subscription_id == stripe_subscription_id
+                )
+            )
+            subscription = result.scalars().first()
+
+            if subscription is None:
+                return None
+
+            return {
+                "id": subscription.id,
+                "user_id": subscription.user_id,
+                "plan_id": subscription.plan_id,
+                "end_date": subscription.end_date,
+                "is_active": subscription.is_active,
+            }
+
+    return _read
+
+
+@pytest.fixture
+def seed_plan():
+    """
+    Creates a bare SubscriptionPlan and returns its id.
+
+    The webhook refuses to act on an invoice whose plan_id no longer exists, so a
+    test of the first-payment path needs a real plan to point its metadata at.
+    The uuid suffix is not optional: `name` is unique and the in-memory database
+    is shared across the whole session.
+    """
+    async def _seed(price: float = 3000) -> int:
+        async with TestingSessionLocal() as session:
+            plan = SubscriptionPlan(
+                name=f"Webhook Plan {uuid.uuid4().hex[:6]}",
+                description="Created by seed_plan",
+                price=price,
+                duration_days=30,
+            )
+            session.add(plan)
+            await session.commit()
+            return plan.id
+
+    return _seed
+
+
+@pytest.fixture
 def expire_subscription():
     """
     Deactivates an existing subscription, the way losing a pass really happens.
