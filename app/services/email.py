@@ -51,9 +51,12 @@ def frontend_link(path: str) -> str:
 # ==========================================
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
 
-# Only these three are ever substituted. Anything else that looks like a
+# Only these four are ever substituted. Anything else that looks like a
 # placeholder is left alone rather than silently becoming an empty string.
-_PLACEHOLDER_PATTERN = re.compile(r"\{\{(name|email|verificationUrl)\}\}")
+# It is an allowlist, so a template using a placeholder that is missing here
+# fails LOUDLY - the raw {{...}} is printed on the page - rather than quietly
+# emailing somebody a button that goes nowhere.
+_PLACEHOLDER_PATTERN = re.compile(r"\{\{(name|email|verificationUrl|resetUrl)\}\}")
 
 
 @lru_cache(maxsize=None)
@@ -324,7 +327,32 @@ async def send_verification_email(email: str, token: str, name: str | None = Non
 
 
 async def send_password_reset_email(email: str, token: str):
+    """
+    Sends the branded password reset email.
+
+    No `name` parameter, unlike the verification mail above: this is queued from
+    /forgot-password, which answers with the same generic 200 whether or not the
+    address exists. reset-password.html greets the address rather than the person
+    for that reason - and because render_template fills an unknown placeholder
+    with an empty string, so a {{name}} nobody passes would render as a blank gap.
+    """
     reset_url = frontend_link(f"/reset-password?token={token}")
     subject = "Password Reset Request"
-    text_body = f"We received a request to reset your password. Click below:\n\n{reset_url}"
-    await get_email_provider().send_email(to_email=email, subject=subject, text_body=text_body)
+
+    # The plain text version still carries the link on its own, so a missing or
+    # unreadable template downgrades the mail instead of breaking the reset.
+    text_body = (
+        "We received a request to reset your password. Click below to securely change it:\n\n"
+        f"{reset_url}\n\n"
+        "This link expires in 24 hours.\n"
+        "If you didn't ask for a password reset, you can ignore this email."
+    )
+
+    html_body = render_template("reset-password.html", {
+        "email": email,
+        "resetUrl": reset_url,
+    })
+
+    await get_email_provider().send_email(
+        to_email=email, subject=subject, text_body=text_body, html_body=html_body
+    )

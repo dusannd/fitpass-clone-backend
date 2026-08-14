@@ -1,6 +1,6 @@
 import pytest
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import StaticPool
@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.models.coaching import Appointment
 from app.models.access import EntryLog
-from app.models.subscription import SubscriptionPlan, UserSubscription
+from app.models.subscription import GymLocation, SubscriptionPlan, SubscriptionRule, UserSubscription
 from app.models.user import User, Role
 
 limiter.enabled = False
@@ -144,6 +144,10 @@ def seed_subscription():
         days_left: int = 30,
         is_active: int = 1,
         includes_trainer: bool = False,
+        location_names: list[str] | None = None,
+        allowed_days: str | None = None,
+        allowed_time_start: time | None = None,
+        allowed_time_end: time | None = None,
     ):
         async with TestingSessionLocal() as session:
             if plan_id is None:
@@ -157,6 +161,25 @@ def seed_subscription():
                     # ask for True explicitly.
                     includes_trainer=includes_trainer,
                 )
+
+                # Locations and the time/day rule are what the door policy reads.
+                # Both default to None so every existing caller still gets the
+                # unrestricted plan it always got - a plan with no locations
+                # attached is deny-by-default at the turnstile, so attaching them
+                # eagerly would break tests that have nothing to do with doors.
+                if location_names:
+                    for location_name in location_names:
+                        plan.locations.append(
+                            GymLocation(name=f"{location_name} {uuid.uuid4().hex[:6]}")
+                        )
+
+                if allowed_days is not None or allowed_time_start is not None:
+                    plan.rule = SubscriptionRule(
+                        allowed_days=allowed_days,
+                        allowed_time_start=allowed_time_start,
+                        allowed_time_end=allowed_time_end,
+                    )
+
                 session.add(plan)
                 await session.flush()
                 plan_id = plan.id
@@ -174,6 +197,25 @@ def seed_subscription():
             return subscription.id
 
     return _seed
+
+
+@pytest.fixture
+def plan_location_ids():
+    """
+    Reads back the gym ids attached to a seeded subscription's plan.
+
+    seed_subscription still returns just the subscription id, so that every one of
+    its existing callers keeps working unchanged. A door test needs the location
+    ids too - "valid at gym A, refused at gym B" cannot be written without them -
+    and this keeps that lookup out of the test bodies.
+    """
+    async def _ids(subscription_id: int) -> list[int]:
+        async with TestingSessionLocal() as session:
+            subscription = await session.get(UserSubscription, subscription_id)
+            plan = await session.get(SubscriptionPlan, subscription.plan_id)
+            return [location.id for location in plan.locations]
+
+    return _ids
 
 
 @pytest.fixture

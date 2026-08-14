@@ -48,21 +48,34 @@ def gym_timezone() -> ZoneInfo:
     return ZoneInfo(settings.GYM_TIMEZONE)
 
 
+def ensure_utc(ts: datetime) -> datetime:
+    """
+    Stamps a stored timestamp as UTC if the database handed it back naive.
+
+    SQLite drops the offset, so the test database returns naive datetimes while
+    Postgres returns aware ones - and mixing the two is not a subtle difference:
+    subtracting one from the other raises TypeError outright, and .astimezone() on
+    a naive value silently assumes the SERVER's timezone instead of UTC.
+
+    Anything that does arithmetic on a column value needs this. to_gym_time below
+    is built on it for exactly that reason.
+    """
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+
+    return ts
+
+
 def to_gym_time(ts: datetime) -> datetime:
     """
     Moves a stored timestamp onto the gym's wall clock.
 
-    Naive values are stamped as UTC first, and that step is the whole point:
-    SQLite drops the offset, so the test database hands back naive datetimes while
-    Postgres returns aware ones. Calling .astimezone() on a naive value makes
-    Python assume the SERVER's timezone instead, which would bucket the same row
-    differently under test than in production - the kind of bug that only shows up
-    once it is deployed somewhere that isn't UTC.
+    Naive values are stamped as UTC first (see ensure_utc), and that step is the
+    whole point: it is what stops the same row bucketing one way under test and
+    another in production - the kind of bug that only shows up once it is deployed
+    somewhere that isn't UTC.
     """
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    return ts.astimezone(gym_timezone())
+    return ensure_utc(ts).astimezone(gym_timezone())
 
 
 def gym_day_bounds_utc(days_back: int = 0) -> tuple[datetime, datetime]:

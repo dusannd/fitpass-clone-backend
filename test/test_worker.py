@@ -1,9 +1,10 @@
 import pytest
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from httpx import AsyncClient, ASGITransport
 
 from app.main import app
+from app.api.helpers import to_gym_time
 from app.api.worker import get_current_worker
 
 
@@ -421,3 +422,318 @@ async def test_worker_endpoints_are_closed_to_everyone_else():
 
         for url in endpoints:
             assert (await ac.get(url, headers=headers)).status_code == 403
+
+
+# --- 7. STATUS: THE DOOR POLICY AT THE DESK ---
+#
+# The status endpoint used to answer on the subscription row alone, so it told a
+# worker "Allowed to enter." for a member standing in a gym their plan does not
+# cover, or hours before their plan opens - with the manual override button right
+# underneath. It now runs the same check_entry_policy() the turnstile runs.
+
+def _window_around(local_now: datetime) -> tuple[time, time]:
+    """
+    A one hour window centred on the gym's LOCAL wall clock.
+
+    Deliberately narrow, and that is the whole point of it: Belgrade runs at least
+    an hour ahead of UTC, so a window this tight contains the local time and
+    excludes the UTC one. A status endpoint reading the wrong clock therefore
+    fails the test rather than quietly passing it.
+
+    The ends are clamped into the same day so the window can never wrap past
+    midnight - `start <= t <= end` is unsatisfiable when start > end, which would
+    deny for a reason the test is not trying to prove.
+    """
+    seconds = local_now.hour * 3600 + local_now.minute * 60 + local_now.second
+    start = max(0, seconds - 1800)
+    end = min(86399, seconds + 1800)
+
+    return (
+        time(start // 3600, (start % 3600) // 60, start % 60),
+        time(end // 3600, (end % 3600) // 60, end % 60),
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_allows_a_valid_pass_at_a_covered_gym(seed_subscription, plan_location_ids):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Covered", "Member")
+            sub_id = await seed_subscription(user_id, location_names=["Central"])
+            (covered_gym,) = await plan_location_ids(sub_id)
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id={covered_gym}")
+
+            assert res.status_code == 200
+            body = res.json()
+            assert body["has_active_subscription"] is True
+            assert body["subscription_active"] is True
+            assert body["denial_reason"] is None
+            # Plan details ride along, so the desk can read the pass out loud
+            assert body["plan_name"].startswith("Seeded Plan")
+            assert body["days_left"] == 29  # seeded 30 days out, minus the part-day already elapsed
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_refuses_a_valid_pass_at_an_uncovered_gym(seed_subscription, plan_location_ids):
+    """
+    The hole this closes: a fully paid up member at the wrong branch used to read
+    as "Subscription active. Allowed to enter." while the turnstile refused them.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Wrong", "Branch")
+            sub_id = await seed_subscription(user_id, location_names=["Central"])
+            (covered_gym,) = await plan_location_ids(sub_id)
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id={covered_gym + 9999}")
+
+            assert res.status_code == 200
+            body = res.json()
+            # The green light is off...
+            assert body["has_active_subscription"] is False
+            # ...but the pass is real, which is what tells the desk this is a
+            # different situation from somebody who never paid.
+            assert body["subscription_active"] is True
+            assert body["denial_reason"] == "location"
+            assert "location" in body["message"].lower()
+            assert body["plan_name"].startswith("Seeded Plan")
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_without_a_location_skips_the_location_check(seed_subscription):
+    """
+    "Is this pass any good at all?" is a fair question at the desk, and answering
+    it with a location refusal when no location was named would be a lie.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "No", "Location")
+            await seed_subscription(user_id, location_names=["Central"])
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status")
+
+            assert res.status_code == 200
+            assert res.json()["has_active_subscription"] is True
+            assert res.json()["denial_reason"] is None
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_refuses_a_pass_outside_its_allowed_days(seed_subscription, plan_location_ids):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Wrong", "Day")
+
+            # Every day EXCEPT the gym's local one. Read off the gym clock, not the
+            # server's: the two are different dates for two hours out of every day.
+            today = to_gym_time(datetime.now(timezone.utc)).weekday()
+            other_days = ",".join(str(d) for d in range(7) if d != today)
+
+            sub_id = await seed_subscription(user_id, location_names=["Central"], allowed_days=other_days)
+            (covered_gym,) = await plan_location_ids(sub_id)
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id={covered_gym}")
+
+            body = res.json()
+            assert body["has_active_subscription"] is False
+            assert body["subscription_active"] is True
+            assert body["denial_reason"] == "day"
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_refuses_a_pass_outside_its_allowed_hours(seed_subscription, plan_location_ids):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Too", "Early")
+
+            # A window three hours from now, which no clock in play is inside
+            local_now = to_gym_time(datetime.now(timezone.utc))
+            start, end = _window_around(local_now + timedelta(hours=3, minutes=30))
+
+            sub_id = await seed_subscription(
+                user_id, location_names=["Central"],
+                allowed_time_start=start, allowed_time_end=end,
+            )
+            (covered_gym,) = await plan_location_ids(sub_id)
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id={covered_gym}")
+
+            body = res.json()
+            assert body["has_active_subscription"] is False
+            assert body["subscription_active"] is True
+            assert body["denial_reason"] == "time"
+            assert "hours" in body["message"].lower()
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_reads_the_gym_clock_not_utc(seed_subscription, plan_location_ids):
+    """
+    The sharp one. The window is one hour wide and centred on the gym's LOCAL
+    time, so it contains the local clock and excludes the UTC clock - Belgrade is
+    at least an hour ahead. Reading .time() off a UTC timestamp, which is what the
+    turnstile itself used to do, turns this green light red.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Local", "Clock")
+
+            local_now = to_gym_time(datetime.now(timezone.utc))
+            start, end = _window_around(local_now)
+
+            sub_id = await seed_subscription(
+                user_id, location_names=["Central"],
+                allowed_time_start=start, allowed_time_end=end,
+            )
+            (covered_gym,) = await plan_location_ids(sub_id)
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id={covered_gym}")
+
+            assert res.json()["denial_reason"] is None
+            assert res.json()["has_active_subscription"] is True
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_status_reports_no_pass_at_all_distinctly():
+    """
+    subscription_active is what separates "never paid" from "paid, wrong gym".
+    Both read has_active_subscription False, and the desk treats them differently.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Never", "Paid")
+
+            res = await ac.get(f"/api/worker/user/{user_id}/status?location_id=1")
+
+            body = res.json()
+            assert body["has_active_subscription"] is False
+            assert body["subscription_active"] is False
+            assert body["denial_reason"] == "none"
+            # Nothing to report about a pass that does not exist
+            assert "plan_name" not in body
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+# --- 8. REVOKING A PASS ---
+
+@pytest.mark.asyncio
+async def test_worker_can_revoke_a_pass(seed_subscription):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Revoke", "Me")
+            await seed_subscription(user_id, location_names=["Central"])
+
+            res = await ac.post(f"/api/worker/user/{user_id}/cancel-subscription")
+            assert res.status_code == 200, res.text
+            assert res.json()["status"] == "success"
+
+            # The pass is gone as far as every later check is concerned
+            after = await ac.get(f"/api/worker/user/{user_id}/status")
+            assert after.json()["has_active_subscription"] is False
+            assert after.json()["subscription_active"] is False
+            assert after.json()["denial_reason"] == "none"
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_pass_that_is_not_there_is_refused():
+    """
+    A 400 rather than a cheerful 200: a worker who clicks revoke on the wrong row
+    must not be told it worked.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            user_id, _ = await register_member(ac, "Nothing", "ToRevoke")
+
+            res = await ac.post(f"/api/worker/user/{user_id}/cancel-subscription")
+
+            assert res.status_code == 400
+            assert "no active subscription" in res.json()["detail"].lower()
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_revoking_an_unknown_user_is_a_404():
+    """
+    Separated from the 400 above on purpose - "that user does not exist" and "that
+    user has nothing to revoke" are different problems at the desk.
+
+    The detail string is asserted, not just the status code. A route that does not
+    exist at all ALSO answers 404, so checking the number alone would leave this
+    test passing against a build with no cancel endpoint in it - which is exactly
+    what it did when the fix was reverted to check.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            res = await ac.post("/api/worker/user/99999999/cancel-subscription")
+            assert res.status_code == 404
+            assert res.json()["detail"] == "User not found"
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_revoking_is_closed_to_everyone_else(seed_subscription):
+    """
+    Without the role gate, any logged in member could cancel anybody's pass -
+    including their own gym rival's.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        victim_id, _ = await register_member(ac, "Innocent", "Victim")
+        sub_id = await seed_subscription(victim_id)
+        url = f"/api/worker/user/{victim_id}/cancel-subscription"
+
+        # a) No cookie at all
+        assert (await ac.post(url)).status_code == 401
+
+        # b) A real, logged in member - valid token, wrong role
+        _, email = await register_member(ac, "Nosy", "Member")
+        res_login = await ac.post("/api/users/login", json={
+            "email": email, "password": "strongpassword123"
+        })
+        headers = {"Cookie": f"access_token={res_login.cookies['access_token']}"}
+        assert (await ac.post(url, headers=headers)).status_code == 403
+
+        # And the pass really is untouched
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+            still_there = await ac.get(f"/api/worker/user/{victim_id}/status")
+            assert still_there.json()["subscription_active"] is True
+            assert sub_id is not None
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)

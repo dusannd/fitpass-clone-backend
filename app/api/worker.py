@@ -12,7 +12,8 @@ from app.models.user import User, Role
 from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.api.dependencies import RequireRole
-from app.api.helpers import build_like_pattern, full_name
+from app.api.entry_policy import check_entry_policy
+from app.api.helpers import build_like_pattern, ensure_utc, full_name
 
 router = APIRouter()
 
@@ -136,14 +137,44 @@ async def manual_entry_override(
     }
 
 
+# What each entry_policy refusal code means at the desk. The turnstile phrases the
+# same three codes as "Access Denied" (see ENTRY_DENIAL_MESSAGES in access.py); a
+# worker is not being refused anything, they are being told why the pass in front
+# of them will not open this door.
+STATUS_DENIAL_MESSAGES = {
+    "location": "Subscription active, but NOT valid for this location. Do not let them in.",
+    "day": "Subscription active, but NOT valid on this day of the week. Do not let them in.",
+    "time": "Subscription active, but outside the allowed hours for this plan. Do not let them in.",
+}
+
+
 @router.get("/user/{target_user_id}/status")
 async def check_user_status(
         target_user_id: int,
+        location_id: int | None = Query(
+            None, description="The gym being checked. Omit to ask whether the pass is valid at all."
+        ),
         db: AsyncSession = Depends(get_db),
         worker_id: int = Depends(get_current_worker)  # Only workers can access this endpoint
 ):
     """
-    Desk worker checks the status of a user (to see if their subscription is active).
+    Desk worker checks whether a member may walk in right now.
+
+    This used to answer on the subscription row alone - is_active and end_date -
+    and nothing else. That made it disagree with the turnstile, which has always
+    also checked the plan's locations and its time/day rule: the panel said
+    "Subscription active. Allowed to enter." for a member standing in a gym their
+    plan does not cover, with the manual override button right underneath it.
+
+    It now runs the same check_entry_policy() the turnstile runs, so the two can
+    only ever say the same thing.
+
+    Three outcomes, not two:
+      - no pass at all            -> has_active_subscription False, subscription_active False
+      - a pass, but not here/now  -> has_active_subscription False, subscription_active True
+      - a pass, valid right now   -> both True
+    has_active_subscription stays the single "is the green light on" flag, so a
+    caller that only reads it still behaves safely.
     """
     # 1. Find the user
     result_user = await db.execute(select(User).where(User.id == target_user_id))
@@ -152,13 +183,18 @@ async def check_user_status(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 2. Check if the user has an active subscription
+    # 2. Find the active subscription, with everything the policy check reads.
+    #    The plan's locations are lazy="selectin" already; the rule is a plain
+    #    relationship, so it needs an explicit selectinload or touching it raises
+    #    MissingGreenlet under asyncio.
     now = datetime.now(timezone.utc)
 
-    # SQLAlchemy magic: Join tables to get the plan name alongside the subscription data
     stmt = (
-        select(UserSubscription, SubscriptionPlan.name)
-        .join(SubscriptionPlan, UserSubscription.plan_id == SubscriptionPlan.id)
+        select(UserSubscription)
+        .options(
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.locations),
+            selectinload(UserSubscription.plan).selectinload(SubscriptionPlan.rule),
+        )
         .where(
             and_(
                 UserSubscription.user_id == target_user_id,
@@ -166,35 +202,117 @@ async def check_user_status(
                 UserSubscription.end_date > now
             )
         )
+        # Newest pass first, id as the tiebreaker - the same ordering access.py
+        # uses. Without it this took .first() off an unordered query, so WHICH
+        # plan's locations and hours got reported was whatever the database
+        # happened to hand back.
+        .order_by(UserSubscription.end_date.desc(), UserSubscription.id.desc())
     )
     result_sub = await db.execute(stmt)
-    active_sub_record = result_sub.first()
+    active_sub = result_sub.scalars().first()
 
-    # 3. Prepare the response for the frontend application
-    if not active_sub_record:
-        return {
-            "user_id": user.id,
-            "full_name": full_name(user),
-            "email": user.email,
-            "has_active_subscription": False,
-            "message": "User DOES NOT have an active subscription! Do not let them in."
-        }
-
-    # If active, unpack the tuple returned by the database
-    user_sub, plan_name = active_sub_record
-
-    # Calculate how many days are left until expiration
-    days_left = (user_sub.end_date - now).days
-
-    return {
+    # The identity fields every branch returns, so the three shapes below only
+    # differ where they genuinely differ.
+    base = {
         "user_id": user.id,
         "full_name": full_name(user),
         "email": user.email,
+    }
+
+    # 3a. No pass at all.
+    if not active_sub:
+        return {
+            **base,
+            "has_active_subscription": False,
+            "subscription_active": False,
+            "denial_reason": "none",
+            "message": "User DOES NOT have an active subscription! Do not let them in."
+        }
+
+    # 3b. There is a pass. Report it either way - a worker explaining a refusal
+    #     needs the plan name and the expiry just as much as one waving somebody
+    #     through, and the revoke button needs to know a pass exists at all.
+    pass_details = {
+        "plan_name": active_sub.plan.name,
+        # ensure_utc, not a bare subtraction: SQLite hands end_date back naive and
+        # subtracting a naive datetime from an aware one is a TypeError, not a
+        # rounding difference. This branch simply had no test until now.
+        "days_left": (ensure_utc(active_sub.end_date) - now).days,
+        "expires_on": active_sub.end_date,
+        "subscription_active": True,
+    }
+
+    denial = check_entry_policy(active_sub.plan, location_id, now)
+    if denial:
+        return {
+            **base,
+            **pass_details,
+            "has_active_subscription": False,
+            "denial_reason": denial,
+            "message": STATUS_DENIAL_MESSAGES[denial],
+        }
+
+    return {
+        **base,
+        **pass_details,
         "has_active_subscription": True,
-        "plan_name": plan_name,
-        "days_left": days_left,
-        "expires_on": user_sub.end_date,
+        "denial_reason": None,
         "message": "Subscription active. Allowed to enter."
+    }
+
+
+@router.post("/user/{target_user_id}/cancel-subscription")
+async def cancel_user_subscription(
+        target_user_id: int,
+        db: AsyncSession = Depends(get_db),
+        worker_id: int = Depends(get_current_worker)
+):
+    """
+    Desk worker revokes a member's pass.
+
+    Deliberately does NOT touch Redis. Revoking a pass is a billing decision, not
+    a physical one - a member halfway through a workout should not be marked as
+    having left the building. force_checkout below is what does that.
+
+    Known gap, worth saying out loud: if the subscription came from Stripe
+    (stripe_subscription_id is set) this only stops access. The member keeps
+    being BILLED until the subscription is cancelled at Stripe too.
+    """
+    # 1. Confirm the user exists, so "no active subscription" never really means
+    #    "that user ID does not exist" - two different problems for the desk.
+    result_user = await db.execute(select(User).where(User.id == target_user_id))
+    user = result_user.scalars().first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 2. Same "which pass counts" ordering as the status check above
+    now = datetime.now(timezone.utc)
+
+    stmt = (
+        select(UserSubscription)
+        .where(
+            and_(
+                UserSubscription.user_id == target_user_id,
+                UserSubscription.is_active == 1,
+                UserSubscription.end_date > now
+            )
+        )
+        .order_by(UserSubscription.end_date.desc(), UserSubscription.id.desc())
+    )
+    result_sub = await db.execute(stmt)
+    active_sub = result_sub.scalars().first()
+
+    if not active_sub:
+        raise HTTPException(status_code=400, detail="This user has no active subscription to cancel.")
+
+    # 3. is_active is an Integer flag on this table, not a Boolean
+    active_sub.is_active = 0
+    await db.commit()
+
+    return {
+        "status": "success",
+        "message": f"The pass for {full_name(user)} has been revoked by worker ID {worker_id}."
     }
 
 
