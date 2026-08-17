@@ -1,0 +1,80 @@
+# =============================================================================
+# Production image for the FitPass FastAPI backend.
+#
+# Unlike the frontend, this is a SINGLE-stage build. Multi-stage pays off when
+# the build tools differ from the runtime tools — Node builds a bundle it then
+# doesn't need. Python is interpreted: the same interpreter that "builds"
+# (installs packages) also runs the app, so there is nothing to throw away.
+#
+# (There IS a multi-stage variant for Python — installing into a virtualenv in
+# stage 1 and copying it to a `-slim` runtime — but it only wins when packages
+# need a C compiler. Every dependency here ships prebuilt wheels, so it would
+# add complexity for almost no size saving.)
+# =============================================================================
+
+# `slim` = Debian without the ~700MB of docs, compilers and tooling in the full
+# image, but still glibc-based (unlike alpine, whose musl libc has no
+# manylinux wheels — pip would fall back to compiling from source).
+#
+# Python 3.13 to match the development virtualenv (.venv is 3.13.7). Matching
+# the dev interpreter is the cheapest way to avoid "works on my machine".
+FROM python:3.13-slim
+
+# --- 1. INTERPRETER BEHAVIOUR -----------------------------------------------
+# Don't write .pyc files: the container filesystem is disposable, so caching
+# bytecode to disk only bloats the image layers.
+ENV PYTHONDONTWRITEBYTECODE=1
+# Don't buffer stdout/stderr. This one really matters in Docker: without it,
+# Python holds log lines in a buffer and `docker logs` looks empty while the
+# app is actually running fine — the single most confusing container symptom.
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# --- 2. DEPENDENCIES, IN THEIR OWN LAYER ------------------------------------
+# Same caching trick as the frontend: copy only requirements.txt first.
+# Docker reuses this layer as long as that file is byte-identical, so editing a
+# router does not trigger a full reinstall of SQLAlchemy, Stripe and Pillow.
+COPY requirements.txt .
+
+# --no-cache-dir stops pip from keeping a copy of every downloaded wheel inside
+# the image. Nothing will ever reinstall from that cache, so it is pure weight.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# --- 3. APPLICATION CODE ----------------------------------------------------
+# Copied last, because it changes most often — everything above stays cached.
+# .dockerignore keeps out .venv, tests, secrets and IDE state.
+# This also brings along app/templates/ (the HTML email templates, which the
+# email service reads from disk at runtime).
+COPY . .
+
+# Documentation only; docker-compose decides what is actually reachable.
+# Note we deliberately do NOT publish this port to the host in production —
+# all traffic enters through Nginx.
+EXPOSE 8000
+
+# --- 4. HOW THE APP STARTS --------------------------------------------------
+#   --host 0.0.0.0
+#       Bind to every interface. The default 127.0.0.1 is the *container's* own
+#       loopback, which nothing outside the container can reach — a classic
+#       "my container starts but nothing connects" bug.
+#
+#   --proxy-headers / --forwarded-allow-ips=*
+#       We sit behind Nginx, so every request appears to come from the proxy
+#       over plain http. These flags make uvicorn trust X-Forwarded-For and
+#       X-Forwarded-Proto, so client IPs (used by the rate limiter) and the
+#       original scheme (used by the security-headers middleware to decide on
+#       HSTS) are correct. `*` is acceptable here because the only thing that
+#       can reach this port is our own Nginx container on a private network.
+#
+#   No --workers / --reload
+#       --reload is a development-only file watcher.
+#       --workers is left off on purpose: app/main.py's lifespan starts an
+#       in-process APScheduler (hourly deactivate_expired_subscriptions) with
+#       no distributed lock, so N workers would mean N schedulers running the
+#       same UPDATE. Scaling out requires extracting the scheduler first.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--proxy-headers", \
+     "--forwarded-allow-ips=*"]
