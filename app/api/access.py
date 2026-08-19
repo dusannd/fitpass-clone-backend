@@ -117,6 +117,18 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     Secure WebSocket endpoint. Reads the HTTP-Only cookie automatically sent by the browser.
     """
+    # Accept the handshake BEFORE authenticating. Closing a socket that was never
+    # accepted makes Starlette answer the upgrade with a plain HTTP 403, and the
+    # WebSocket spec forbids browsers from exposing that status to JavaScript: the
+    # client only ever sees close code 1006 ("abnormal closure"), which is exactly
+    # what a dropped network looks like. Accepting first sends the refusal as a
+    # real close frame, so the frontend can tell "your session expired, stop
+    # retrying" apart from "the WiFi blinked, keep retrying" - the whole point of
+    # the reconnect logic in useGymWebSocket.ts on the frontend.
+    await websocket.accept()
+
+    user_id: int | None = None
+
     try:
         token = websocket.cookies.get("access_token")
         if not token:
@@ -126,7 +138,7 @@ async def websocket_endpoint(websocket: WebSocket):
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = int(payload.get("sub"))
 
-        await ws_manager.connect(websocket, user_id)
+        ws_manager.connect(websocket, user_id)
 
         while True:
             await websocket.receive_text()
@@ -136,9 +148,15 @@ async def websocket_endpoint(websocket: WebSocket):
     except jwt.InvalidTokenError:
         await websocket.close(code=1008, reason="Invalid token")
     except WebSocketDisconnect:
-        ws_manager.disconnect(user_id)
+        pass
     except Exception as e:
         await websocket.close(code=1011, reason=str(e))
+    finally:
+        # Runs on every exit path, so a socket can never be left in the registry.
+        # Passing the socket keeps a stale handler from evicting the newer
+        # connection the same member may already have opened.
+        if user_id is not None:
+            ws_manager.disconnect(user_id, websocket)
 
 
 @router.post("/scan", response_model=ScanResponse)
