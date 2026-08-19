@@ -43,7 +43,17 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # RELATIONSHIPS
-    subscriptions = relationship("UserSubscription", backref="user")
+    # The cascade is NOT optional here, and its absence used to make deleting any
+    # subscribed user fail outright. Without it SQLAlchemy's default is to
+    # DE-ASSOCIATE the children instead of removing them - it emits
+    # `UPDATE user_subscriptions SET user_id = NULL`, which the NOT NULL column
+    # rejects, so the whole DELETE came back as a 500. The ON DELETE CASCADE on the
+    # foreign key never got a chance, because the ORM nullifies before the database
+    # is ever asked. Deleting via the ORM (rather than passive_deletes=True) also
+    # keeps SQLite and Postgres behaving identically: SQLite does not enforce
+    # foreign keys unless the PRAGMA is on, so leaning on the database here would
+    # make the tests prove something different from what production does.
+    subscriptions = relationship("UserSubscription", backref="user", cascade="all, delete-orphan")
     # Connects User to Role via the user_roles table
     roles = relationship("Role", secondary=user_roles, lazy="selectin")
     # Coaching relationships (Trainer-Client links)

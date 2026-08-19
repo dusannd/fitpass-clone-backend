@@ -6,11 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from app.api.dependencies import get_current_admin, get_current_user_id
+from starlette.concurrency import run_in_threadpool
 import jwt
+import logging
+import stripe
 
 from app.core.rate_limit import limiter
 # We now import the Role model as well
 from app.models.user import User, Role, UserProfile
+from app.models.subscription import UserSubscription
 from app.core.database import get_db
 from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
 PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest,
@@ -21,6 +25,13 @@ from app.services.email import create_action_token, send_verification_email, sen
 from app.services.recaptcha import verify_recaptcha
 from app.services.storage import save_avatar, delete_avatar
 
+
+logger = logging.getLogger(__name__)
+
+# Set here as well as in payments.py. It is the same value written to the same
+# global, but a billing call must not depend on another router happening to have
+# been imported first - import order is not something this module controls.
+stripe.api_key = settings.STRIPE_API_KEY
 
 router = APIRouter()
 
@@ -347,8 +358,47 @@ async def delete_user(
             detail=f"User with ID {user_id} does not exist."
         )
 
-    # 3. If exists, proceed with deletion
-    # (Cascade delete handles logs and subscriptions automatically due to DB foreign keys)
+    # 3. Cancel any live Stripe subscription BEFORE the row disappears.
+    # Deleting the account only removes OUR records - Stripe knows nothing about
+    # our database and keeps charging the card. Worse, the cascade below destroys
+    # the stripe_subscription_id in the same transaction, so after this point
+    # there is nothing left to look the subscription up by.
+    #
+    # Queried directly instead of walking user_to_delete.subscriptions on purpose:
+    # that relationship is a plain (non-selectin) one, so touching it here would
+    # trigger a lazy load. A separate SELECT sidesteps that entirely.
+    result = await db.execute(
+        select(UserSubscription.stripe_subscription_id).where(
+            UserSubscription.user_id == user_id,
+            UserSubscription.is_active == 1,
+            UserSubscription.stripe_subscription_id.is_not(None),
+        )
+    )
+
+    # A member can hold more than one active row - an upgrade leaves the previous
+    # subscription behind - so cancel every distinct id rather than the first one
+    # found. Half-fixing this is worse than not fixing it, because it looks fixed.
+    for stripe_sub_id in set(result.scalars().all()):
+        try:
+            # run_in_threadpool because the Stripe SDK is synchronous `requests`
+            # underneath; calling it bare in an async route blocks the event loop
+            # for the whole round trip.
+            await run_in_threadpool(stripe.Subscription.cancel, stripe_sub_id)
+        except stripe.StripeError:
+            # Deliberately non-fatal: an admin has to be able to delete an account
+            # while Stripe is down - a GDPR erasure request does not wait for
+            # someone else's outage. Logged at ERROR rather than warning, with the
+            # id spelled out, because the row is about to be deleted and this line
+            # becomes the ONLY record of a subscription that is still billing and
+            # now has to be cancelled by hand in the Stripe dashboard.
+            logger.error(
+                "Failed to cancel Stripe subscription %s while deleting user %s. "
+                "It is STILL BILLING and must be cancelled manually.",
+                stripe_sub_id, user_id, exc_info=True,
+            )
+
+    # 4. Now remove the user. The related rows go with it through the ORM cascade
+    # configured on User.subscriptions and its sibling relationships.
     await db.delete(user_to_delete)
     await db.commit()
 
