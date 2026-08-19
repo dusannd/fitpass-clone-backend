@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.core.websockets import ConnectionManager
@@ -60,6 +62,40 @@ def test_disconnect_removes_the_socket_it_was_given():
     manager.disconnect(7, socket)
 
     assert 7 not in manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_failed_send_does_not_evict_the_socket_that_replaced_it():
+    """
+    The same race, but inside send_personal_message rather than the endpoint.
+
+    `await websocket.send_json(...)` is a suspension point, not a straight line:
+    while it is parked the event loop is free to run the websocket route for a
+    member who has just reconnected, and that registers a new socket under the
+    same user_id. If the failure handler then removes the entry blindly, it
+    deletes the connection that just replaced the broken one.
+
+    This path matters more than it looks. send_personal_message is reached from
+    log_and_notify in app/api/access.py, which is the ordinary QR scan - so it
+    fires exactly when a member walks up to the turnstile, which is exactly when
+    their phone is handing off from mobile data to the gym WiFi.
+    """
+    manager = ConnectionManager()
+    live = FakeSocket("live")
+
+    class DyingSocket:
+        """Fails the send, but only after giving the loop a chance to run."""
+
+        async def send_json(self, message):
+            await asyncio.sleep(0)              # the reconnect lands here
+            manager.connect(live, user_id=1)
+            raise RuntimeError("socket already gone")
+
+    manager.connect(DyingSocket(), user_id=1)
+
+    await manager.send_personal_message({"type": "ACCESS_EVENT"}, user_id=1)
+
+    assert manager.active_connections.get(1) is live
 
 
 def test_disconnect_without_a_socket_stays_unconditional():

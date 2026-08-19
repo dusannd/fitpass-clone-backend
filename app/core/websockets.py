@@ -54,7 +54,12 @@ class ConnectionManager:
                 await websocket.send_json(message)
             except Exception as e:
                 logger.error(f"Failed to send WS message to user {user_id}: {e}")
-                self.disconnect(user_id)
+                # Pass the socket, because the await above is a suspension point,
+                # not a straight line: a member who reconnected while the send was
+                # parked has already registered a new socket under this user_id.
+                # Removing the entry blindly here would delete that live
+                # connection instead of the broken one we were writing to.
+                self.disconnect(user_id, websocket)
 
 # Global instance
 ws_manager = ConnectionManager()
