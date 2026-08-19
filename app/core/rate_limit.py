@@ -24,8 +24,16 @@ from app.core.config import settings
 # The fallback degrades to per-process counting while Redis is away - exactly the
 # behaviour we had before this change - and slowapi probes the backend periodically
 # and switches back on its own once Redis answers again.
+#
+# --- 3. TELLING THE CLIENT WHEN TO COME BACK ---
+# headers_enabled makes slowapi send Retry-After (plus the X-RateLimit-* trio) with
+# the seconds left in the window. Without it a 429 body only says "Rate limit
+# exceeded: 5 per 1 minute", which carries no deadline - the login page had to guess
+# a flat 60 seconds. The header is an integer here, not an HTTP date, because that
+# formatting only kicks in when retry_after is set to "http-date".
 limiter = Limiter(
     key_func=get_remote_address,
     storage_uri=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0",
     in_memory_fallback_enabled=True,
+    headers_enabled=True,
 )

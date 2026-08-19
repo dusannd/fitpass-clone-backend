@@ -47,7 +47,9 @@ class UserProfileResponse(UserProfileBase):
 # --- SCHEMA FOR USERS ---
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str
+    # Matches the 6 character rule the register form enforces. Without it the API
+    # accepts a 1 character password from anything that skips the frontend.
+    password: str = Field(min_length=6)
     first_name: str
     last_name: str
     # HONEYPOT FIELD: Real users will send None. Bots will fill this out.
@@ -124,7 +126,8 @@ class PasswordResetRequest(BaseModel):
 
 class PasswordResetConfirm(BaseModel):
     token: str
-    new_password: str
+    # Same minimum as UserCreate - a reset must not be a way around it.
+    new_password: str = Field(min_length=6)
 
 
 # --- EMAIL VERIFICATION SCHEMAS ---
