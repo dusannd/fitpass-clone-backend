@@ -230,9 +230,9 @@ class SMTPEmailProvider(EmailProvider):
 class MockEmailProvider(EmailProvider):
     async def send_email(self, to_email: str, subject: str, text_body: str, html_body: str | None = None):
         print("\n" + "=" * 60)
-        print(f"📧 MOCK EMAIL SENT TO: {to_email}")
+        print(f" MOCK EMAIL SENT TO: {to_email}")
         print(f"Subject: {subject}")
-        # The HTML part is thousands of characters of table markup - noting that
+        # The HTML part is thousands of characters of table markup - noting thatgi
         # it is attached is far more readable in a test log than dumping it.
         print(f"HTML part: {'attached' if html_body else 'none'}")
         print(f"Body:\n{text_body}")
