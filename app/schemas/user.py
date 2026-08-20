@@ -47,7 +47,9 @@ class UserProfileResponse(UserProfileBase):
 # --- SCHEMA FOR USERS ---
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str
+    # Matches the 6 character rule the register form enforces. Without it the API
+    # accepts a 1 character password from anything that skips the frontend.
+    password: str = Field(min_length=6)
     first_name: str
     last_name: str
     # HONEYPOT FIELD: Real users will send None. Bots will fill this out.
@@ -98,13 +100,37 @@ class RoleManageRequest(BaseModel):
     role_name: str
 
 
+class StaffResponse(BaseModel):
+    """
+    A single staff row for the Admin HR panel.
+
+    Deliberately leaner than UserResponse: the panel only renders a name, an email
+    and role badges, so shipping every staff member's whole subscription history
+    and profile bio along with it would be far more data than the screen uses.
+
+    first_name and last_name stay Optional because the columns are nullable, so an
+    account created with nothing but an email still serializes instead of raising.
+    """
+    id: int
+    email: EmailStr
+    first_name: Optional[str]
+    last_name: Optional[str]
+    roles: List[RoleResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # --- PASSWORD RESET SCHEMAS ---
 class PasswordResetRequest(BaseModel):
     email: EmailStr
+    # NEW: reCAPTCHA token from the frontend. Public endpoint that sends mail, so it
+    # gets the same bot check as register and login.
+    recaptcha_token: Optional[str] = None
 
 class PasswordResetConfirm(BaseModel):
     token: str
-    new_password: str
+    # Same minimum as UserCreate - a reset must not be a way around it.
+    new_password: str = Field(min_length=6)
 
 
 # --- EMAIL VERIFICATION SCHEMAS ---

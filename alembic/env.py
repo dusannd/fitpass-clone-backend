@@ -95,12 +95,11 @@ async def run_async_migrations() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
-    # now it runs only on async
-    asyncio.run(run_async_migrations())
-
-
-
-
+    # Exactly one asyncio.run. A second call here does not crash - each one builds
+    # and tears down its own event loop - it silently runs the WHOLE migration pass
+    # a second time, which is invisible for `upgrade head` (already at head, so the
+    # second pass does nothing) but destructive for a relative target:
+    # `downgrade -1` walks back two revisions and `upgrade +1` applies two.
     asyncio.run(run_async_migrations())
 
 

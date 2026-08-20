@@ -1,0 +1,48 @@
+# Excluded from the build context — the snapshot Docker uploads before building.
+# Without this file the context is gigabytes and every build crawls.
+
+# --- 1. Virtualenvs ---------------------------------------------------------
+# A virtualenv holds a full Windows Python install: huge, and useless in a Linux
+# image. pip rebuilds everything from requirements.txt inside the container.
+# (The dot-prefixed spelling is already covered by the rule below; these are the
+# plain ones.)
+venv/
+env/
+
+# --- 2. Everything hidden ---------------------------------------------------
+# A single pattern for version control, virtualenvs, caches, and editor and
+# tooling state — nothing the build needs starts with a dot.
+#
+# Excluding .env here is deliberate: pydantic-settings loads it from the working
+# directory, so baking one into the image would freeze development credentials
+# into a distributable artifact. Production values are injected by
+# docker-compose (env_file / environment), and real environment variables take
+# precedence over any .env anyway.
+.*
+
+# --- 3. Python bytecode -----------------------------------------------------
+__pycache__/
+*.py[cod]
+
+# --- 4. Not needed to run the API -------------------------------------------
+test/
+test_main.http
+pytest.ini
+assets/
+
+# --- 5. Documentation and local notes ---------------------------------------
+# Matched by pattern rather than listed by name, so it keeps holding as notes
+# come and go. requirements.txt is the one .txt the build genuinely needs, so it
+# is added back afterwards — in .dockerignore the LAST matching rule wins.
+*.md
+*.txt
+!requirements.txt
+
+# --- 6. Uploaded avatars ----------------------------------------------------
+# These come from the `avatar_data` volume at runtime, not from the image.
+# Copying them in would also mean they reappear on every redeploy.
+app/static/avatars/
+
+# --- 7. Docker's own files --------------------------------------------------
+Dockerfile*
+docker-compose*.yml

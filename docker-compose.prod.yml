@@ -1,0 +1,259 @@
+# =============================================================================
+# FitPass — production stack.
+#
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# Then open http://localhost
+#
+# WHY --env-file .env.prod?
+#   Compose has TWO separate notions of environment:
+#     * interpolation — filling in the ${...} placeholders in THIS file. It
+#       reads the shell plus a `.env` sitting next to the compose file.
+#     * `env_file:` on a service — variables handed to the *container*.
+#   This repo already has a `.env` holding development secrets, and we do not
+#   want that silently feeding a production stack. `--env-file .env.prod`
+#   redirects interpolation to the production file so both notions read the
+#   same source. Copy .env.prod.example to .env.prod and fill it in first.
+#
+# TOPOLOGY
+#   Only `frontend` publishes a port. db, redis and backend are reachable only
+#   from inside the automatically-created compose network, where each service
+#   name (`db`, `redis`, `backend`) resolves via Docker's internal DNS. Nothing
+#   from the outside can touch Postgres or the API directly — every request
+#   enters through Nginx on port 80.
+#
+#   browser ──80──▶ frontend (nginx) ──┬── static files (the React build)
+#                                      └── /api/* ──▶ backend:8000 ──┬─▶ db:5432
+#                                                                    └─▶ redis:6379
+#
+# NOTE ON HTTPS: the login cookie is set with Secure=True (see
+# app/api/users.py). Browsers accept a Secure cookie over plain http ONLY on
+# `localhost`, which is treated as a trusted context. So this stack works for a
+# local demo, but on a real domain or IP you MUST terminate TLS at Nginx or
+# login will fail with no visible error. Details in .env.prod.example.
+# =============================================================================
+
+# An explicit project name, and NOT an optional nicety.
+#
+# By default Compose names the project after the folder it runs in — which
+# would be `fitpass-clone` for BOTH this file and the development
+# docker-compose.yml sitting next to it. Sharing a project name means sharing
+# containers, network and, worst of all, VOLUMES: starting this stack would
+# replace the dev containers and point production straight at the development
+# database. Naming the project keeps the two completely separate, right down to
+# `fitpass-prod_postgres_data` vs `fitpass-clone_postgres_data`.
+name: fitpass-prod
+
+services:
+
+  # --- 1. DATABASE ----------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: fitpass_db_prod
+    restart: unless-stopped
+
+    environment:
+      # Built from the same three variables the backend's DATABASE_URL uses
+      # below, so the credentials can never drift out of sync.
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - copy .env.prod.example to .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-fitpass_db}
+
+    volumes:
+      # A NAMED VOLUME. Container filesystems are disposable — delete the
+      # container and everything written inside it is gone. The volume lives
+      # outside the container's lifecycle, so `docker compose down` followed by
+      # `up` keeps every user, plan and entry log.
+      # (`docker compose down -v` DOES delete it. That is the only way to lose
+      # the data, and it is deliberate — treat -v as "wipe the database".)
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      # `depends_on` alone only means "the container has been started". Postgres
+      # takes several seconds after that before it accepts connections, and the
+      # backend crashes on its first query if it wins that race. pg_isready is
+      # the real signal, and it is what `condition: service_healthy` waits for.
+      # $$ escapes the $ so compose passes it through for the container's shell.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    # No `ports:` on purpose. In development we published 5433:5432 to inspect
+    # the DB from the host; in production that would expose Postgres to the
+    # network for no reason.
+
+  # --- 2. CACHE / RATE LIMITER / QR TOKEN STORE -----------------------------
+  redis:
+    image: redis:alpine
+    container_name: fitpass_redis_prod
+    restart: unless-stopped
+
+    volumes:
+      # The dev setup had no volume. Redis here holds QR access tokens and rate
+      # limit counters — losing them on restart is survivable but sloppy, and a
+      # volume costs nothing.
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- 3. DATABASE MIGRATIONS (runs once, then exits) -----------------------
+  migrate:
+    # Identical build to `backend`, and the same `image:` tag, so Docker builds
+    # it once and both services share the result.
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    image: fitpass-backend:prod
+    container_name: fitpass_migrate_prod
+
+    # The app's lifespan does NOT create tables or run migrations, so somebody
+    # has to. A dedicated one-shot service is clearer than hiding it in an
+    # entrypoint script, and it guarantees migrations finish BEFORE the API
+    # starts serving — `backend` waits on service_completed_successfully below.
+    command: alembic upgrade head
+
+    env_file:
+      - .env.prod
+    environment:
+      # alembic/env.py imports app.core.database, so it reads the very same
+      # DATABASE_URL as the app. Keep these identical to the backend service.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-fitpass_db}
+      REDIS_HOST: redis
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # This container is *supposed* to exit. Without this it would be restarted
+    # forever after each successful run.
+    restart: "no"
+
+  # --- 4. THE API -----------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    image: fitpass-backend:prod
+    container_name: fitpass_backend_prod
+    restart: unless-stopped
+
+    env_file:
+      # Secrets and optional settings: SECRET_KEY, STRIPE_*, RESEND/SMTP,
+      # RECAPTCHA_SECRET, GYM_TIMEZONE...
+      - .env.prod
+
+    environment:
+      # These are set here rather than in .env.prod because they describe the
+      # container network, not the deployment's secrets — and real environment
+      # variables take precedence over .env in pydantic-settings.
+
+      # `db` is the service name, and 5432 is the port INSIDE the network (the
+      # 5433 from the dev compose was only a host-side mapping). The
+      # +asyncpg driver prefix is mandatory: app/core/database.py feeds this
+      # string to create_async_engine verbatim, with no rewriting.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-fitpass_db}
+
+      # The app takes host+port, not a redis:// URL (app/core/redis_client.py).
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # Used to build the links inside verification and password-reset emails.
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+
+      # CAREFUL: this setting is typed List[str], and pydantic-settings parses
+      # complex types as JSON — so it must look like a JSON array, not a
+      # comma-separated string. In practice CORS is never exercised here
+      # (Nginx makes the frontend and API same-origin), but a wrong value
+      # would break any future cross-origin client.
+      CORS_ORIGINS: '["${FRONTEND_URL:-http://localhost}"]'
+
+      # Must stay false/unset. `secure` on the auth cookie is derived as
+      # `not TESTING`, so TESTING=true would ship a non-Secure session cookie.
+      TESTING: "false"
+
+    volumes:
+      # Uploaded profile pictures are written to app/static/avatars on disk
+      # (app/services/storage.py resolves the path from the module location, so
+      # inside the image it is /app/app/static). Without this volume every
+      # redeploy silently wipes every user's avatar.
+      - avatar_data:/app/app/static
+
+    healthcheck:
+      # python:3.13-slim ships no curl or wget, and installing one just for a
+      # healthcheck would grow the image. urlopen raises on a non-2xx status,
+      # and an uncaught exception exits non-zero — which is exactly the signal
+      # Docker wants.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        # Do not start until the schema is actually up to date.
+        condition: service_completed_successfully
+
+    # No `ports:` — Nginx is the only way in.
+
+  # --- 5. THE SPA + REVERSE PROXY -------------------------------------------
+  frontend:
+    build:
+      # The frontend lives in a SEPARATE git repository which is not a sibling
+      # of this one, so there is no tidy relative path. The default below is
+      # correct for the original development machine; anyone else sets
+      # FRONTEND_PATH in .env.prod to point at their own checkout.
+      context: "${FRONTEND_PATH:-../../Front-End projekti/fitpass-clone-frontend}"
+      dockerfile: Dockerfile.prod
+
+      args:
+        # Vite inlines these into the JavaScript bundle at BUILD time, which is
+        # why they are build args and not `environment:`. Putting them under
+        # `environment:` is the classic mistake — the container would get them,
+        # but the bundle was finalised long before the container existed.
+        #
+        # A relative /api is what makes the whole same-origin design work: the
+        # browser requests https://<this-host>/api/... and Nginx proxies it, so
+        # the API host never has to be known at build time.
+        VITE_API_BASE_URL: /api
+        VITE_FEATURE_RECAPTCHA: ${VITE_FEATURE_RECAPTCHA:-false}
+        VITE_RECAPTCHA_SITE_KEY: ${VITE_RECAPTCHA_SITE_KEY:-}
+
+    container_name: fitpass_frontend_prod
+    restart: unless-stopped
+
+    ports:
+      # host:container — the single door into the whole stack.
+      - "80:80"
+
+    depends_on:
+      backend:
+        # More than politeness: nginx.conf names `backend` in proxy_pass, and
+        # Nginx resolves that hostname when it loads its config. If the backend
+        # container does not exist yet, Nginx refuses to start at all.
+        condition: service_healthy
+
+    healthcheck:
+      # nginx:alpine has busybox wget but no curl.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+# --- NAMED VOLUMES -----------------------------------------------------------
+# Managed by Docker and independent of any container's lifetime.
+# Inspect with `docker volume ls`.
+volumes:
+  postgres_data:
+  redis_data:
+  avatar_data:

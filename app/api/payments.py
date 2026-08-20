@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_
+from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
 
 from app.core.database import get_db
@@ -96,6 +97,103 @@ async def create_checkout_session(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/customer-portal")
+async def create_customer_portal_session(
+        db: AsyncSession = Depends(get_db),
+        user_id: int = Depends(get_current_user_id)
+):
+    """
+    Creates a Stripe Billing Portal session for the caller's active subscription.
+
+    The portal is Stripe's own hosted page: cancelling, swapping the card on file
+    and downloading invoices all happen there, so we never handle card data.
+    Returns the one-time URL the frontend redirects to.
+    """
+    # 1. Find the caller's active subscription. Same ordering as
+    #    GET /subscriptions/my-subscription so both endpoints agree on which row
+    #    is "the" active one if a user somehow ends up holding two.
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(UserSubscription)
+        .where(
+            and_(
+                UserSubscription.user_id == user_id,
+                UserSubscription.is_active == 1,
+                UserSubscription.end_date > now
+            )
+        )
+        .order_by(UserSubscription.end_date.desc())
+    )
+    active_sub = result.scalars().first()
+
+    if not active_sub:
+        raise HTTPException(
+            status_code=400,
+            detail="You don't have an active subscription to manage."
+        )
+
+    # 2. Legacy rows (and anything the desk activated by hand) have no Stripe
+    #    subscription behind them, so there is no portal to send them to.
+    if not active_sub.stripe_subscription_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This subscription wasn't created through Stripe, so it can't be managed online."
+        )
+
+    try:
+        # 3. We don't store stripe_customer_id, so read it off the subscription.
+        #    Both Stripe calls go through run_in_threadpool: the SDK is synchronous
+        #    `requests` under the hood, and calling it bare inside an async route
+        #    blocks the entire event loop for two network round trips.
+        stripe_sub = await run_in_threadpool(
+            stripe.Subscription.retrieve, active_sub.stripe_subscription_id
+        )
+        customer_id = stripe_sub.customer
+
+        # 4. Mint the session. return_url is where Stripe's "Back to..." link goes.
+        portal_session = await run_in_threadpool(
+            lambda: stripe.billing_portal.Session.create(
+                customer=customer_id,
+                return_url=f"{settings.FRONTEND_URL}/subscriptions"
+            )
+        )
+    except stripe.StripeError:
+        # Stripe being unreachable is an upstream failure, not a bug on our side -
+        # a 502 says that honestly and keeps it out of our 5xx error budget.
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Stripe right now. Please try again in a moment."
+        )
+
+    return {"url": portal_session.url}
+
+
+def extract_subscription_id(invoice) -> str | None:
+    """
+    Digs the Stripe subscription id out of an invoice object.
+
+    Newer Stripe API versions nest it under
+    `parent.subscription_details.subscription` instead of the legacy top-level
+    `subscription` field, so we fall back between the two.
+
+    A function rather than two copies of the ladder: it exists precisely because
+    Stripe has already moved this field once, and when they move it again there
+    should be one place to change. Both the payment_succeeded and the
+    payment_failed branch read it.
+
+    getattr throughout, never .get - a stripe.StripeObject is not a dict subclass
+    in stripe-python 15.x and has no .get at all.
+    """
+    subscription_id = getattr(invoice, "subscription", None)
+    if subscription_id:
+        return subscription_id
+
+    parent = getattr(invoice, "parent", None)
+    nested_details = getattr(parent, "subscription_details", None) if parent else None
+
+    return getattr(nested_details, "subscription", None) if nested_details else None
+
+
 @router.post("/webhook")
 async def stripe_webhook(
         request: Request,
@@ -123,14 +221,7 @@ async def stripe_webhook(
     if event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
 
-        # Extract the subscription's Stripe ID. Newer Stripe API versions nest this
-        # under `parent.subscription_details.subscription` instead of the legacy
-        # top-level `subscription` field, so we fall back between the two.
-        stripe_subscription_id = getattr(invoice, "subscription", None)
-        if not stripe_subscription_id:
-            parent = getattr(invoice, "parent", None)
-            nested_details = getattr(parent, "subscription_details", None) if parent else None
-            stripe_subscription_id = getattr(nested_details, "subscription", None) if nested_details else None
+        stripe_subscription_id = extract_subscription_id(invoice)
 
         # The first (and only, for our single-item checkout) invoice line item.
         # Used both as a metadata fallback below and as the source of truth for
@@ -147,7 +238,13 @@ async def stripe_webhook(
         metadata = getattr(subscription_details, "metadata", None) if subscription_details else None
 
         if not metadata and first_line:
-            metadata = first_line.get("metadata")
+            # getattr, NOT .get(). A line item is a stripe.StripeObject, which as of
+            # stripe-python 15.x is not a dict subclass and has no .get - calling it
+            # raises AttributeError, which turns this whole webhook into a 500 and
+            # means the member's subscription row never gets created at all. The
+            # failure is invisible until it happens, because this branch only runs
+            # when invoice.subscription_details is absent.
+            metadata = getattr(first_line, "metadata", None)
 
         # IDEMPOTENCY: Stripe can (and does) redeliver the same webhook event on
         # network retries. Incrementing end_date by a duration would double-grant
@@ -197,6 +294,42 @@ async def stripe_webhook(
                     )
                     db.add(new_sub)
 
+                await db.commit()
+
+    elif event['type'] == 'invoice.payment_failed':
+        # A recurring charge was refused. Until now nothing reacted to this at all,
+        # so a member whose card stopped working kept full turnstile access until
+        # Stripe eventually gave up and fired customer.subscription.deleted - weeks
+        # of free training.
+        #
+        # Revoking on the FIRST failure is deliberate, and it is safe because it
+        # heals itself: Stripe retries a failed invoice on its dunning schedule, and
+        # the payment_succeeded branch above sets is_active back to 1 on the row it
+        # finds. So a member whose card merely hiccuped is let back in automatically
+        # the moment the retry clears, with nobody at the desk having to do anything.
+        #
+        # Known limitation, worth writing down rather than rediscovering: webhooks
+        # are NOT ordered. A payment_failed for an earlier attempt can arrive after
+        # the retry's payment_succeeded and revoke a member who is actually paid up.
+        # The next successful invoice restores them, and guarding against it would
+        # cost a Stripe round-trip on every failure, so we accept it.
+        invoice = event['data']['object']
+        stripe_subscription_id = extract_subscription_id(invoice)
+
+        if stripe_subscription_id:
+            result = await db.execute(
+                select(UserSubscription).where(
+                    UserSubscription.stripe_subscription_id == stripe_subscription_id
+                )
+            )
+            user_sub = result.scalars().first()
+
+            # No row for this subscription is not an error - it may belong to
+            # another environment sharing the same Stripe account. Falling through
+            # to the 200 below stops Stripe retrying something we will never handle.
+            if user_sub:
+                user_sub.is_active = 0
+                db.add(user_sub)
                 await db.commit()
 
     elif event['type'] == 'customer.subscription.deleted':

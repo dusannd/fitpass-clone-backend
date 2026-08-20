@@ -16,12 +16,31 @@ from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan, SubscriptionRule, plan_locations
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse, GenerateQRRequest
 from app.api.dependencies import RequireRole
+from app.api.entry_policy import check_entry_policy
 
 router = APIRouter()
 
 # Bouncers
 get_current_worker = RequireRole("worker")
 get_current_member = RequireRole("member")
+
+# What each entry_policy refusal code means at the turnstile: the line written to
+# the audit log, and the line the member sees. Kept as data so the two can never
+# fall out of step with the codes check_entry_policy actually returns.
+ENTRY_DENIAL_MESSAGES = {
+    "location": (
+        "Access Denied: Your plan does not include this location.",
+        "Access Denied: Your plan does not include this location.",
+    ),
+    "day": (
+        "Access Denied: Outside allowed days for your plan.",
+        "Access Denied: Your plan does not allow access on this day.",
+    ),
+    "time": (
+        "Access Denied: Outside allowed time window for your plan.",
+        "Access Denied: Your plan does not allow access at this time.",
+    ),
+}
 
 
 async def resolve_user_status(db: AsyncSession, user_id: int, status_key: str) -> str:
@@ -98,6 +117,18 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     Secure WebSocket endpoint. Reads the HTTP-Only cookie automatically sent by the browser.
     """
+    # Accept the handshake BEFORE authenticating. Closing a socket that was never
+    # accepted makes Starlette answer the upgrade with a plain HTTP 403, and the
+    # WebSocket spec forbids browsers from exposing that status to JavaScript: the
+    # client only ever sees close code 1006 ("abnormal closure"), which is exactly
+    # what a dropped network looks like. Accepting first sends the refusal as a
+    # real close frame, so the frontend can tell "your session expired, stop
+    # retrying" apart from "the WiFi blinked, keep retrying" - the whole point of
+    # the reconnect logic in useGymWebSocket.ts on the frontend.
+    await websocket.accept()
+
+    user_id: int | None = None
+
     try:
         token = websocket.cookies.get("access_token")
         if not token:
@@ -107,7 +138,7 @@ async def websocket_endpoint(websocket: WebSocket):
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = int(payload.get("sub"))
 
-        await ws_manager.connect(websocket, user_id)
+        ws_manager.connect(websocket, user_id)
 
         while True:
             await websocket.receive_text()
@@ -117,9 +148,15 @@ async def websocket_endpoint(websocket: WebSocket):
     except jwt.InvalidTokenError:
         await websocket.close(code=1008, reason="Invalid token")
     except WebSocketDisconnect:
-        ws_manager.disconnect(user_id)
+        pass
     except Exception as e:
         await websocket.close(code=1011, reason=str(e))
+    finally:
+        # Runs on every exit path, so a socket can never be left in the registry.
+        # Passing the socket keeps a stale handler from evicting the newer
+        # connection the same member may already have opened.
+        if user_id is not None:
+            ws_manager.disconnect(user_id, websocket)
 
 
 @router.post("/scan", response_model=ScanResponse)
@@ -198,6 +235,13 @@ async def scan_qr_code(
                 )
             )
             .distinct()
+            # Newest pass first, with id as the tiebreaker. This used to take
+            # .first() off an unordered query, so WHICH plan's locations and hours
+            # were applied at the door was whatever the database happened to return.
+            # payments.py refuses a second concurrent subscription, so it should
+            # never matter - but now that plans genuinely grant different things,
+            # an arbitrary pick is a door that opens on some scans and not others.
+            .order_by(UserSubscription.end_date.desc(), UserSubscription.id.desc())
         )
         result = await db.execute(stmt)
         active_sub = result.scalars().first()
@@ -207,31 +251,18 @@ async def scan_qr_code(
                                  "No active subscription found.")
             raise HTTPException(status_code=403, detail="Access Denied: No active subscription.")
 
-        # 4a. LOCATION CHECK: Does this plan grant access to the scanned gym?
-        allowed_location_ids = [loc.id for loc in active_sub.plan.locations]
-        if payload.location_id not in allowed_location_ids:
-            await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                                 "Access Denied: Your plan does not include this location.")
-            raise HTTPException(status_code=403, detail="Access Denied: Your plan does not include this location.")
-
-        # 4b. TIME/DAY RULE CHECK: Plans without a rule are unrestricted (24/7, every day)
-        rule = active_sub.plan.rule
-        if rule:
-            current_time = now.time()
-            current_weekday = now.weekday()  # 0=Monday ... 6=Sunday, matches allowed_days convention
-
-            if rule.allowed_days:
-                allowed_days_list = [int(d) for d in rule.allowed_days.split(",") if d.strip() != ""]
-                if current_weekday not in allowed_days_list:
-                    await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                                         "Access Denied: Outside allowed days for your plan.")
-                    raise HTTPException(status_code=403, detail="Access Denied: Your plan does not allow access on this day.")
-
-            if rule.allowed_time_start and rule.allowed_time_end:
-                if not (rule.allowed_time_start <= current_time <= rule.allowed_time_end):
-                    await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                                         "Access Denied: Outside allowed time window for your plan.")
-                    raise HTTPException(status_code=403, detail="Access Denied: Your plan does not allow access at this time.")
+        # 4a. LOCATION + TIME/DAY RULE CHECK.
+        #     The rules themselves now live in app/api/entry_policy.py, because the
+        #     desk worker's status endpoint has to reach the SAME verdict - a panel
+        #     that says "allowed to enter" while this turnstile refuses the very same
+        #     person sends a worker to the override button in good faith.
+        #     The wording stays here: a member reads "Access Denied", a worker reads
+        #     something else entirely.
+        denial = check_entry_policy(active_sub.plan, payload.location_id, now)
+        if denial:
+            log_reason, http_detail = ENTRY_DENIAL_MESSAGES[denial]
+            await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type, log_reason)
+            raise HTTPException(status_code=403, detail=http_detail)
 
     # 5. SUCCESS: UPDATE REDIS STATE & LOG
     new_status = "INSIDE" if action_type == "ENTRY" else "OUTSIDE"

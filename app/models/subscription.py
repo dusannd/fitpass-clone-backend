@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Time, Table, Boolean
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Time, Table, Boolean, false
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -38,6 +38,32 @@ class SubscriptionPlan(Base):
 
     # NEW: Used for Soft Deletion (hiding old plans from the frontend)
     is_active = Column(Boolean, default=True)
+
+    # Drives the pricing-card styling on the member side ("Standard", "Pro", "VIP").
+    # Kept as a plain String (not an Enum) to match is_active/allowed_days, and so
+    # adding a tier later is a one-line schema change instead of a Postgres type
+    # migration. The allowed values are enforced in the Pydantic layer.
+    # server_default backfills existing rows during the ALTER TABLE; default covers
+    # ORM inserts, which never touch the server default.
+    tier = Column(String, default="Standard", server_default="Standard", nullable=False)
+
+    # --- PLAN PERKS ---
+    # What the membership actually INCLUDES, as opposed to how its card is styled.
+    # tier is purely cosmetic; these are the columns that make a VIP plan worth
+    # more than the cheapest one.
+    #
+    # Only includes_trainer is enforced in code (app/api/coaching.py). The other
+    # four are settled at the desk by a person - nothing in software can hand
+    # somebody a towel - so they live here to be advertised on the pricing card.
+    #
+    # Every one carries a server_default as well as a Python default. is_active
+    # above was added nullable with no backfill, which is why PlanResponse still
+    # needs a validator to paper over NULL rows; that is not repeated here.
+    includes_trainer = Column(Boolean, default=False, server_default=false(), nullable=False)
+    includes_group_classes = Column(Boolean, default=False, server_default=false(), nullable=False)
+    has_sauna_access = Column(Boolean, default=False, server_default=false(), nullable=False)
+    has_towel_service = Column(Boolean, default=False, server_default=false(), nullable=False)
+    allows_guest = Column(Boolean, default=False, server_default=false(), nullable=False)
 
     # Relationships
     user_subscriptions = relationship("UserSubscription", back_populates="plan")

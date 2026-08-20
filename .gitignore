@@ -12,5 +12,8 @@ __pycache__/
 
 # Environment varijable (Tu cemo drzati sifru baze, OVO NE SME NA GITHUB)
 .env
+# Production secrets used by docker-compose.prod.yml.
+# Only .env.prod.example (placeholders) belongs in git.
+.env.prod
 # User uploaded profile pictures (these must NOT go to GitHub)
 app/static/avatars/

@@ -16,9 +16,9 @@ async def test_workout_logging_flow():
     """
     INTEGRATION TEST (Workout Progress Tracking):
     1. Register Trainer and Member.
-    2. Trainer creates a workout plan with an exercise.
-    3. Member completes the workout and logs their actual performance (weight, sets).
-    4. Member fetches their workout history and verifies the data.
+    2. Trainer creates a workout plan with an exercise (incl. the live workout setup fields).
+    3. Member completes the workout and logs ONE ROW PER SET.
+    4. Member fetches their workout history and verifies every set came back.
     """
     transport = ASGITransport(app=app)
 
@@ -53,26 +53,38 @@ async def test_workout_logging_flow():
             "name": "Heavy Chest Day",
             "description": "Focus on bench press",
             "exercises": [
-                {"name": "Bench Press", "sets": 3, "reps": "8-10", "rest_time_seconds": 90}
+                {
+                    "name": "Bench Press",
+                    "sets": 3,
+                    "reps": "8-10",
+                    "rest_time_seconds": 90,
+                    "recommended_weight_kg": 80.0,
+                    "weight_step_kg": 4.5,
+                    "instructions": "3 sec negatives"
+                }
             ]
         }
         res_plan = await ac.post("/api/trainer/plans", json=plan_payload, headers=trainer_headers)
         assert res_plan.status_code == 200
 
         plan_id = res_plan.json()["id"]
-        exercise_id = res_plan.json()["exercises"][0]["id"]
+        created_exercise = res_plan.json()["exercises"][0]
+        exercise_id = created_exercise["id"]
 
-        # --- 3. MEMBER LOGS A WORKOUT SESSION ---
+        # The trainer setup must actually reach the database, otherwise the client app
+        # silently falls back to the defaults and the "+" button steps by the wrong amount.
+        assert created_exercise["recommended_weight_kg"] == 80.0
+        assert created_exercise["weight_step_kg"] == 4.5
+        assert created_exercise["instructions"] == "3 sec negatives"
+
+        # --- 3. MEMBER LOGS A WORKOUT SESSION (one entry per set) ---
         log_payload = {
             "plan_id": plan_id,
             "notes": "Felt incredibly strong today!",
             "exercises": [
-                {
-                    "exercise_id": exercise_id,
-                    "sets_completed": 3,
-                    "reps_completed": "10",
-                    "weight_kg": 85.5  # Lifted 85.5 kg!
-                }
+                {"exercise_id": exercise_id, "set_number": 1, "reps_completed": "10", "weight_kg": 80.0},
+                {"exercise_id": exercise_id, "set_number": 2, "reps_completed": "10", "weight_kg": 85.5},
+                {"exercise_id": exercise_id, "set_number": 3, "reps_completed": "8", "weight_kg": 75.0},
             ]
         }
         res_log = await ac.post("/api/workouts/log-session", json=log_payload, headers=member_headers)
@@ -91,8 +103,12 @@ async def test_workout_logging_flow():
         assert len(history) == 1
         assert history[0]["id"] == session_id
 
-        # Verify the deeply nested exercise stats
+        # Verify the deeply nested exercise stats: three separate sets came back in order
         exercise_logs = history[0]["exercise_logs"]
-        assert len(exercise_logs) == 1
-        assert exercise_logs[0]["weight_kg"] == 85.5
+        assert len(exercise_logs) == 3
+        assert [log["set_number"] for log in exercise_logs] == [1, 2, 3]
+        assert [log["weight_kg"] for log in exercise_logs] == [80.0, 85.5, 75.0]
         assert exercise_logs[0]["exercise"]["name"] == "Bench Press"
+
+        # The personal record is the heaviest set of the exercise, not the last one
+        assert max(log["weight_kg"] for log in exercise_logs) == 85.5

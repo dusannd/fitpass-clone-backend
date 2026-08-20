@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     # --- EMAIL SETTINGS ---
     EMAIL_FROM: str = "onboarding@resend.dev"
+    # The display name in front of the address, so the inbox shows
+    # "FitPass <gym@gmail.com>" rather than a bare address.
+    EMAIL_FROM_NAME: str = "FitPass"
     RESEND_API_KEY: Optional[str] = None
 
     # SMTP Fallbacks
@@ -33,6 +36,13 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USER: Optional[str] = None
     SMTP_PASS: Optional[str] = None
+
+    # --- LOCAL TIME ---
+    # The gym's wall clock. Timestamps are stored in UTC, so anything an admin
+    # reads as a time of day - peak hours, "today", the weekly breakdown - has to
+    # be converted into this zone first, or a 01:30 visit is reported as having
+    # happened the previous evening.
+    GYM_TIMEZONE: str = "Europe/Belgrade"
 
     TESTING: bool = False
 

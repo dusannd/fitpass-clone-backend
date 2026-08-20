@@ -5,28 +5,35 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from app.api.dependencies import RequireRole, get_current_user_id
+from app.api.dependencies import get_current_admin, get_current_user_id
+from starlette.concurrency import run_in_threadpool
 import jwt
+import logging
+import stripe
 
 from app.core.rate_limit import limiter
 # We now import the Role model as well
 from app.models.user import User, Role, UserProfile
+from app.models.subscription import UserSubscription
 from app.core.database import get_db
 from app.schemas.user import (UserCreate, UserResponse, UserLogin, Token,
 PasswordResetRequest, PasswordResetConfirm, ResendVerificationRequest,
 UserProfileUpdate, UserProfileResponse)
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.config import settings
-from app.api.dependencies import RequireRole
 from app.services.email import create_action_token, send_verification_email, send_password_reset_email
 from app.services.recaptcha import verify_recaptcha
 from app.services.storage import save_avatar, delete_avatar
 
 
-router = APIRouter()
+logger = logging.getLogger(__name__)
 
-# BOUNCER
-get_current_admin = RequireRole("admin")
+# Set here as well as in payments.py. It is the same value written to the same
+# global, but a billing call must not depend on another router happening to have
+# been imported first - import order is not something this module controls.
+stripe.api_key = settings.STRIPE_API_KEY
+
+router = APIRouter()
 
 
 @router.post("/", response_model=UserResponse)
@@ -105,7 +112,12 @@ async def create_user(
 
     # <--- 2. USE BACKGROUND_TASKS.ADD_TASK INSTEAD OF AWAIT --->
     # The server will return the response immediately and run this function in the background.
-    background_tasks.add_task(send_verification_email, created_user.email, verification_token)
+    # The first name is read here and passed as a plain string. add_task evaluates its
+    # arguments immediately, so nothing hands the ORM object itself to the background
+    # task - by the time that runs, the session is closed and the instance detached.
+    background_tasks.add_task(
+        send_verification_email, created_user.email, verification_token, created_user.first_name
+    )
 
     return created_user
 
@@ -195,8 +207,6 @@ async def login(
     # We no longer need to return the token in the JSON body
     return {"message": "Successfully logged in"}
 
-get_current_admin = RequireRole("admin")
-
 
 @router.get("/me", response_model=UserResponse)
 async def get_my_profile(
@@ -282,6 +292,7 @@ async def update_my_profile(
 @limiter.limit("10/hour")
 async def upload_my_avatar(
         request: Request,  # <--- Required by slowapi for rate limiting (tracks IP)
+        response: Response,  # <--- Required by slowapi to write the X-RateLimit headers
         file: UploadFile = File(...),
         db: AsyncSession = Depends(get_db),
         current_user_id: int = Depends(get_current_user_id),
@@ -348,8 +359,47 @@ async def delete_user(
             detail=f"User with ID {user_id} does not exist."
         )
 
-    # 3. If exists, proceed with deletion
-    # (Cascade delete handles logs and subscriptions automatically due to DB foreign keys)
+    # 3. Cancel any live Stripe subscription BEFORE the row disappears.
+    # Deleting the account only removes OUR records - Stripe knows nothing about
+    # our database and keeps charging the card. Worse, the cascade below destroys
+    # the stripe_subscription_id in the same transaction, so after this point
+    # there is nothing left to look the subscription up by.
+    #
+    # Queried directly instead of walking user_to_delete.subscriptions on purpose:
+    # that relationship is a plain (non-selectin) one, so touching it here would
+    # trigger a lazy load. A separate SELECT sidesteps that entirely.
+    result = await db.execute(
+        select(UserSubscription.stripe_subscription_id).where(
+            UserSubscription.user_id == user_id,
+            UserSubscription.is_active == 1,
+            UserSubscription.stripe_subscription_id.is_not(None),
+        )
+    )
+
+    # A member can hold more than one active row - an upgrade leaves the previous
+    # subscription behind - so cancel every distinct id rather than the first one
+    # found. Half-fixing this is worse than not fixing it, because it looks fixed.
+    for stripe_sub_id in set(result.scalars().all()):
+        try:
+            # run_in_threadpool because the Stripe SDK is synchronous `requests`
+            # underneath; calling it bare in an async route blocks the event loop
+            # for the whole round trip.
+            await run_in_threadpool(stripe.Subscription.cancel, stripe_sub_id)
+        except stripe.StripeError:
+            # Deliberately non-fatal: an admin has to be able to delete an account
+            # while Stripe is down - a GDPR erasure request does not wait for
+            # someone else's outage. Logged at ERROR rather than warning, with the
+            # id spelled out, because the row is about to be deleted and this line
+            # becomes the ONLY record of a subscription that is still billing and
+            # now has to be cancelled by hand in the Stripe dashboard.
+            logger.error(
+                "Failed to cancel Stripe subscription %s while deleting user %s. "
+                "It is STILL BILLING and must be cancelled manually.",
+                stripe_sub_id, user_id, exc_info=True,
+            )
+
+    # 4. Now remove the user. The related rows go with it through the ORM cascade
+    # configured on User.subscriptions and its sibling relationships.
     await db.delete(user_to_delete)
     await db.commit()
 
@@ -366,6 +416,7 @@ async def delete_user(
 @limiter.limit("1/15minutes")
 async def resend_verification(
     request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    response: Response, # <--- Required by slowapi to write the X-RateLimit headers
     payload: ResendVerificationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
@@ -382,8 +433,11 @@ async def resend_verification(
     # We only trigger the email if the user exists AND they are NOT verified yet.
     if user and not user.is_verified:
         verification_token = create_action_token(user.email, "verify_email")
-        # Send the email in the background so the endpoint returns instantly
-        background_tasks.add_task(send_verification_email, user.email, verification_token)
+        # Send the email in the background so the endpoint returns instantly.
+        # The name goes as a plain string, not the ORM object - see /register above.
+        background_tasks.add_task(
+            send_verification_email, user.email, verification_token, user.first_name
+        )
 
     # 3. Always return a 200 OK with the same message, regardless of whether the email exists.
     return {
@@ -427,19 +481,39 @@ async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/forgot-password")
-async def forgot_password(request: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("3/15minutes")
+async def forgot_password(
+    request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    response: Response, # <--- Required by slowapi to write the X-RateLimit headers
+    payload: PasswordResetRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Public Route: User requests a password reset link.
+    Rate limited to 3 requests per 15 minutes - without one, the enumeration
+    below can simply be run as a wordlist at full speed.
     """
-    result = await db.execute(select(User).where(User.email == request.email))
+    # 0.5 SECURITY: reCAPTCHA Verification.
+    # Runs before the lookup so both branches below still cost the same - checking
+    # it later would reintroduce the timing difference step 2 exists to remove.
+    await verify_recaptcha(payload.recaptcha_token)
+
+    # 1. Look up the user by email
+    result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()
 
-    # SECURITY BEST PRACTICE: Always return a generic success message
-    # even if the email doesn't exist, to prevent hackers from "email guessing"
+    # 2. Security: the response never says whether the email exists. That only
+    # holds if the RESPONSE TIME says nothing either - this used to await the
+    # send, which in production is a live HTTPS round trip to Resend. A known
+    # address took a few hundred milliseconds, an unknown one a few, and the
+    # generic message below could be defeated with a stopwatch.
+    # Queueing the mail makes both branches return at the same speed.
     if user:
         reset_token = create_action_token(user.email, "reset_password")
-        await send_password_reset_email(user.email, reset_token)
+        background_tasks.add_task(send_password_reset_email, user.email, reset_token)
 
+    # 3. Always the same body, whether or not the account exists.
     return {"message": "If that email is registered, a password reset link has been sent."}
 
 

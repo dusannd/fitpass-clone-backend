@@ -26,8 +26,25 @@ Base = declarative_base()
 
 # Dependency for FastAPI to get DB session securely
 async def get_db():
+    """
+    Yields a session to the route and cleans up after it, whatever happens.
+
+    The rollback is explicit rather than left to the context manager. Closing a
+    session does discard an open transaction on its own, but only once the
+    exception has already travelled past every other dependency's teardown - and
+    anything that touched the same session in between would hit a
+    PendingRollbackError instead of the real error.
+
+    The exception is re-raised untouched so the global handler in main.py still
+    logs it and answers with a generic 500. HTTPException is caught here too, and
+    that is intended: a route that raises a 404 after a couple of db.add() calls
+    should not leave them pending.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             await session.close()

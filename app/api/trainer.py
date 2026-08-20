@@ -50,13 +50,19 @@ async def create_workout_plan(
     await db.flush()
 
     # 3. Add Exercises
+    # Every field the trainer filled in has to be copied here. Anything we forget is
+    # silently dropped and the client app falls back to the column default instead.
     for ex in plan.exercises:
         new_exercise = Exercise(
             plan_id=new_plan.id,
             name=ex.name,
             sets=ex.sets,
             reps=ex.reps,
-            rest_time_seconds=ex.rest_time_seconds
+            rest_time_seconds=ex.rest_time_seconds,
+            requires_weight=ex.requires_weight,
+            recommended_weight_kg=ex.recommended_weight_kg,
+            weight_step_kg=ex.weight_step_kg,
+            instructions=ex.instructions
         )
         db.add(new_exercise)
 
