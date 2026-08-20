@@ -292,6 +292,7 @@ async def update_my_profile(
 @limiter.limit("10/hour")
 async def upload_my_avatar(
         request: Request,  # <--- Required by slowapi for rate limiting (tracks IP)
+        response: Response,  # <--- Required by slowapi to write the X-RateLimit headers
         file: UploadFile = File(...),
         db: AsyncSession = Depends(get_db),
         current_user_id: int = Depends(get_current_user_id),
@@ -415,6 +416,7 @@ async def delete_user(
 @limiter.limit("1/15minutes")
 async def resend_verification(
     request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    response: Response, # <--- Required by slowapi to write the X-RateLimit headers
     payload: ResendVerificationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
@@ -482,6 +484,7 @@ async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
 @limiter.limit("3/15minutes")
 async def forgot_password(
     request: Request, # <--- Required by slowapi for rate limiting (tracks IP)
+    response: Response, # <--- Required by slowapi to write the X-RateLimit headers
     payload: PasswordResetRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
@@ -491,6 +494,11 @@ async def forgot_password(
     Rate limited to 3 requests per 15 minutes - without one, the enumeration
     below can simply be run as a wordlist at full speed.
     """
+    # 0.5 SECURITY: reCAPTCHA Verification.
+    # Runs before the lookup so both branches below still cost the same - checking
+    # it later would reintroduce the timing difference step 2 exists to remove.
+    await verify_recaptcha(payload.recaptcha_token)
+
     # 1. Look up the user by email
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()

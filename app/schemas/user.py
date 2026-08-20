@@ -123,6 +123,9 @@ class StaffResponse(BaseModel):
 # --- PASSWORD RESET SCHEMAS ---
 class PasswordResetRequest(BaseModel):
     email: EmailStr
+    # NEW: reCAPTCHA token from the frontend. Public endpoint that sends mail, so it
+    # gets the same bot check as register and login.
+    recaptcha_token: Optional[str] = None
 
 class PasswordResetConfirm(BaseModel):
     token: str
