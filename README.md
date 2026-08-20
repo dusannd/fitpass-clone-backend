@@ -20,6 +20,7 @@ Built on FastAPI and Async PostgreSQL — engineered for security, high concurre
  
 - [Overview](#overview)
 - [Core System Architecture](#core-system-architecture)
+- [Data Model](#data-model)
 - [What's New in v4.2](#whats-new-in-v42-latest-architecture-update)
 - [Technical Stack](#technical-stack)
 - [Infrastructure Setup](#infrastructure-setup)
@@ -35,7 +36,7 @@ FitPass Clone orchestrates the entire operational lifecycle of a gym — from St
  
 ## Core System Architecture
  
-The application is structured around four primary domains. For entity-relationship and data-flow diagrams, see [`SCHEMAS.md`](./SCHEMAS.md).
+The application is structured around four primary domains, each owning its own routers, schemas and slice of the relational model.
  
 | Domain | Description |
 |---|---|
@@ -43,6 +44,22 @@ The application is structured around four primary domains. For entity-relationsh
 | **Financial Operations** | Seamlessly integrated with Stripe. Uses robust, idempotent webhooks to handle recurring subscription cycles, dunning-driven access revocation, and complex access parameters (e.g., location-specific or time-restricted memberships). Members manage their own cards, invoices and cancellations through a hosted Billing Portal session. |
 | **Facility Operations** | Extensive Role-Based Access Control (RBAC). Administrators manage HR (hiring/firing) and read live financial and attendance analytics, while desk staff monitor real-time facility capacity, inspect member standing, and securely execute audited manual door overrides that stay synchronized with the Redis presence state. |
 | **Performance & Coaching** | A built-in marketplace for personal training, gated on the subscription perks a member actually paid for. Supports trainer-client relationship mapping, session scheduling, and detailed workout templates. Members log telemetry set by set (weight, reps, sets) for advanced analytical tracking and automatic personal-record detection. |
+ 
+---
+ 
+## Data Model
+ 
+The relational schema spans 18 tables across three domains. Every one of them is documented table by table, with Mermaid entity-relationship diagrams, in [`SCHEMAS.md`](./SCHEMAS.md).
+ 
+| Domain | Tables | Covers |
+|---|---|---|
+| **Identity & Access** | `users`, `user_profiles`, `roles`, `user_roles`, `entry_logs` | Authentication, the RBAC junction, and the immutable turnstile ledger that also backs live attendance. |
+| **Subscriptions & Billing** | `subscription_plans`, `subscription_rules`, `gym_locations`, `plan_locations`, `user_subscriptions` | Commercial offerings and their perks, the temporal and per-location access rules, and the Stripe-reconciled membership ledger. |
+| **Coaching & Workouts** | `trainer_client_links`, `appointments`, `workout_plans`, `exercises`, `user_saved_plans`, `user_dismissed_plans`, `workout_sessions`, `exercise_logs` | The trainer-client state machine, private session scheduling, plan templates, and set-by-set workout telemetry. |
+ 
+> Two conventions worth knowing before reading any endpoint: every timestamp is stored in UTC and rendered in gym-local time through `GYM_TIMEZONE`, and Alembic is the only source of schema truth — the application lifespan runs no migrations and no `create_all`.
+ 
+**→ Full ER diagrams and a table-by-table reference: [`SCHEMAS.md`](./SCHEMAS.md)**
  
 ---
  
