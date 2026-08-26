@@ -245,7 +245,11 @@ services:
 
     healthcheck:
       # nginx:alpine has busybox wget but no curl.
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      #
+      # /healthz is a `return 200` in the frontend's nginx.conf, so this costs
+      # nothing. Polling / instead meant serving the whole of index.html off disk
+      # every ten seconds and writing an access log line for each one.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/healthz"]
       interval: 10s
       timeout: 5s
       retries: 3
