@@ -11,7 +11,7 @@ Built on FastAPI and Async PostgreSQL — engineered for security, high concurre
 [![Stripe](https://img.shields.io/badge/Stripe-Payments-008CDD.svg?style=flat&logo=stripe)](https://stripe.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
 [![Version](https://img.shields.io/badge/version-4.2.0-blueviolet.svg?style=flat)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)]()
+[![License](https://img.shields.io/badge/license-AGPLv3-green.svg?style=flat)](./LICENSE)
  
 </div>
 ---

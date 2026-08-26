@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="FitPass Clone / Gym API",
     description="Backend API for gym management and QR access",
-    version="4.1.0",
+    version="4.2.0",
     lifespan=lifespan
 )
 
