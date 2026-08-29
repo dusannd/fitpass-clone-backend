@@ -183,10 +183,13 @@ async def get_all_plans(
     (GET /plans below only returns active ones, so without this the admin
     panel would lose sight of a plan the moment it gets deactivated.)
     """
+    # Same order the public route uses, so the admin list and the member pricing
+    # cards read the same way. id breaks a price tie: without it two plans priced
+    # alike are free to swap places between two requests.
     stmt = select(SubscriptionPlan).options(
         selectinload(SubscriptionPlan.locations),
         selectinload(SubscriptionPlan.rule)
-    )
+    ).order_by(SubscriptionPlan.price, SubscriptionPlan.id)
     result = await db.execute(stmt)
     return result.scalars().all()
 
@@ -308,6 +311,10 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
     Locations + rule are eagerly loaded so the pricing cards can render
     everything in one request.
     """
+    # Cheapest first: the pricing page renders this list in the order it arrives,
+    # so without an ORDER BY the cards come out in whatever sequence the database
+    # felt like. id is the tie-break, per the "always sort on a unique column too"
+    # rule - two plans at the same price must not swap between requests.
     stmt = (
         select(SubscriptionPlan)
         .options(
@@ -315,6 +322,7 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
             selectinload(SubscriptionPlan.rule)
         )
         .where(SubscriptionPlan.is_active == True) # <--- SMART FILTER
+        .order_by(SubscriptionPlan.price, SubscriptionPlan.id)
     )
     result = await db.execute(stmt)
     return result.scalars().all()
