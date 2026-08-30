@@ -55,7 +55,7 @@ Version 4.2 takes the platform from "runs on my machine" to a deployable product
 - **Unified Door Policy Engine** — Location and time-window validation was extracted into a single shared module consumed by both the turnstile and the desk panel, eliminating the class of bug where a worker was told "allowed to enter" for a member the door itself would refuse. Weekday and hour checks are evaluated in gym-local time rather than UTC.
 - **Tiered Plans with Enforced Perks** — Subscription plans carry real, migration-backfilled perk flags instead of a decorative tier label. Coaching requests and session bookings are gated on the trainer perk, so a premium plan finally sells something the entry plan does not.
 - **Hardened Realtime Channel** — WebSocket refusals are accepted before closing so the browser receives a genuine close code instead of an indistinguishable `1006`, and the connection registry is identity-checked, preventing a phone that hands off from mobile data to gym WiFi from unregistering its own live socket.
-- **Transactional Email Pipeline** — Branded HTML templates for verification and password reset, delivered over Resend or Gmail SMTP, with every link built from the configured `FRONTEND_URL` and every interpolated value HTML-escaped in a single render pass.
+- **Transactional Email Pipeline** — Branded HTML templates for verification and password reset, delivered over Gmail SMTP, with every link built from the configured `FRONTEND_URL` and every interpolated value HTML-escaped in a single render pass.
 - **Analytics on the Gym Clock** — MRR normalized to a 30-day window, 24-bucket peak-hour reporting, weekly breakdowns and a dedicated HR staff endpoint that filters roles in the database instead of paging through the user table. All time-of-day reporting converts UTC to gym-local before bucketing, and "today" is filtered on a half-open range so the timestamp index still applies.
 - **Defence in Depth** — Rate limiting moved to Redis with an in-memory fallback, so counters are shared across workers and survive a cache outage. Every 429 now carries `Retry-After`, unhandled errors return a generic 500 without losing CORS or security headers, and the email-enumeration timing leak on password reset was closed by queuing the mail as a background task.
  
@@ -132,10 +132,10 @@ CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
 # Reporting timezone. Timestamps are stored in UTC and displayed in gym-local time
 GYM_TIMEZONE=Europe/Belgrade
  
-# Transactional email - configure either Resend or SMTP, not both
+# Transactional email - Gmail SMTP. Leave SMTP_* blank to send nothing at all
+# (verification links then have to be read out of the backend log).
 EMAIL_FROM=no-reply@your_domain.com
 EMAIL_FROM_NAME=FitPass
-RESEND_API_KEY=re_your_resend_key
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=465
 SMTP_USER=your_address@gmail.com
@@ -176,7 +176,7 @@ The production stack is fully containerized and self-contained — it ships its 
  
 ```bash
 cp .env.prod.example .env.prod   # then fill in the secrets
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 ```
  
 Four details worth knowing before going live:

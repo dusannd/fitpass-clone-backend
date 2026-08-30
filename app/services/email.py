@@ -3,7 +3,6 @@ import logging
 import re
 import smtplib
 import asyncio
-import resend
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
@@ -16,10 +15,6 @@ from pathlib import Path
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-# Configure Resend API Key
-if settings.RESEND_API_KEY:
-    resend.api_key = settings.RESEND_API_KEY
 
 
 def create_action_token(email: str, action: str) -> str:
@@ -107,44 +102,6 @@ class EmailProvider(ABC):
 
 
 # ==========================================
-# NEW: RESEND PROVIDER
-# ==========================================
-class ResendEmailProvider(EmailProvider):
-    """
-    Implementation using the modern Resend API.
-    """
-
-    def _send_sync(self, to_email: str, subject: str, text_body: str, html_body: str | None):
-        params = {
-            "from": settings.EMAIL_FROM,  # Must be onboarding@resend.dev unless you own a domain
-            "to": [to_email],
-            "subject": subject,
-            # Always send the text part too: it is what plain-text clients and
-            # spam filters read, and it keeps the link reachable if the HTML
-            # fails to render.
-            "text": text_body,
-        }
-        if html_body:
-            params["html"] = html_body
-
-        return resend.Emails.send(params)
-
-    async def send_email(self, to_email: str, subject: str, text_body: str, html_body: str | None = None):
-        try:
-            # Wrap the synchronous Resend SDK call in a background thread
-            await asyncio.to_thread(self._send_sync, to_email, subject, text_body, html_body)
-        except Exception:
-            # Logged rather than printed, and never re-raised: this runs inside a
-            # BackgroundTask, so /register has already answered 200 and there is
-            # nobody left to hand the error to.
-            logger.exception("Resend send to %s failed", to_email)
-            return
-
-        # Outside the try on purpose - see SMTPEmailProvider.send_email below.
-        logger.info("Email sent via Resend to %s", to_email)
-
-
-# ==========================================
 # SMTP PROVIDER (Gmail and anything else speaking SMTP)
 # ==========================================
 # A hung connection here pins a thread from the asyncio threadpool for as long as
@@ -176,9 +133,9 @@ class SMTPEmailProvider(EmailProvider):
         msg["Subject"] = subject
 
         # The sender is the authenticated account, NOT settings.EMAIL_FROM.
-        # EMAIL_FROM defaults to Resend's onboarding@resend.dev, and Gmail refuses
-        # to relay a From header for an address it does not own. Deriving it from
-        # SMTP_USER means the two can never disagree.
+        # Gmail refuses to relay a From header for an address it does not own, so
+        # an EMAIL_FROM that drifts from the mailbox we logged in as would bounce
+        # every message. Deriving it from SMTP_USER means the two cannot disagree.
         msg["From"] = formataddr((settings.EMAIL_FROM_NAME, settings.SMTP_USER))
         msg["To"] = to_email
 
@@ -250,9 +207,9 @@ def get_email_provider() -> EmailProvider:
     `email_provider = get_email_provider()`, which resolved while this module was
     being imported - and test/conftest.py imports app.main (which reaches here)
     BEFORE it sets settings.TESTING = True. The whole suite therefore held a live
-    ResendEmailProvider, and every test that registered a user fired a real HTTP
-    request at the Resend API. It looked harmless only because send_email swallows
-    its own exceptions.
+    provider, and every test that registered a user fired a real request at the
+    mail service. It looked harmless only because send_email swallows its own
+    exceptions. Keep the TESTING check first, and keep this resolved per call.
 
     Constructing a provider is just an object allocation - nothing opens a
     connection until send_email runs - so there is nothing to cache here.
@@ -260,11 +217,9 @@ def get_email_provider() -> EmailProvider:
     if settings.TESTING:
         return MockEmailProvider()
 
-    # Priority 1: Resend
-    if settings.RESEND_API_KEY:
-        return ResendEmailProvider()
-
-    # Priority 2: SMTP
+    # SMTP is the only real transport. All three parts are required: a host with
+    # no credentials would authenticate as nobody, and Gmail rejects that session
+    # - a mail outage that surfaces as "nothing happens".
     if settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASS:
         return SMTPEmailProvider()
 
@@ -276,10 +231,9 @@ def describe_email_provider() -> str:
     """
     One line naming the provider that is actually live, for the startup log.
 
-    "Which provider am I even using" is the first question when mail goes
-    missing, and the factory above decides it silently from whichever credentials
-    happen to be present - drop RESEND_API_KEY back into .env and SMTP stops
-    being used without a word.
+    "Am I actually sending mail" is the first question when a verification link
+    never arrives, and the factory above answers it silently - blank out any one
+    of the three SMTP settings and every send becomes a no-op without a word.
 
     Carries no credentials: the host, the port and the sending address only.
     """
@@ -287,8 +241,6 @@ def describe_email_provider() -> str:
 
     if provider == "SMTPEmailProvider":
         return f"{provider} ({settings.SMTP_HOST}:{settings.SMTP_PORT}, as {settings.SMTP_USER})"
-    if provider == "ResendEmailProvider":
-        return f"{provider} (as {settings.EMAIL_FROM})"
     return f"{provider} (nothing is actually sent)"
 
 

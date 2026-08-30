@@ -117,9 +117,9 @@ async def test_testing_mode_never_reaches_a_live_provider(monkeypatch, capsys):
     Regression: the provider used to be resolved once, at import time, into a
     module-level `email_provider`. conftest imports app.main - which reaches
     app.services.email - BEFORE it sets settings.TESTING = True, so the whole
-    suite held a live ResendEmailProvider and every test that registered a user
-    fired a real request at the Resend API. send_email swallows its own
-    exceptions, so it never showed up as a failure.
+    suite held a live provider and every test that registered a user fired a
+    real request at the mail service. send_email swallows its own exceptions,
+    so it never showed up as a failure.
 
     This has to go through send_verification_email rather than calling
     get_email_provider() directly: that function always read TESTING correctly,
@@ -128,15 +128,26 @@ async def test_testing_mode_never_reaches_a_live_provider(monkeypatch, capsys):
     """
     from app.services.email import send_verification_email
 
-    # A live key present AND TESTING on - the test flag has to win.
-    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_live_key_should_be_ignored")
+    # Full, working SMTP credentials present AND TESTING on - the test flag has
+    # to win, or the suite starts mailing strangers from the developer's Gmail.
+    monkeypatch.setattr(settings, "SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setattr(settings, "SMTP_USER", "gym@gmail.com")
+    monkeypatch.setattr(settings, "SMTP_PASS", "a-real-looking-app-password")
     monkeypatch.setattr(settings, "TESTING", True)
+
+    # Nothing may open a socket. smtplib is monkeypatched to a bomb rather than
+    # to a recording fake: asserting on stdout alone would still pass if the
+    # real provider ran and quietly swallowed a connection error.
+    def explode(*args, **kwargs):
+        raise AssertionError("TESTING mode opened a real SMTP connection")
+
+    monkeypatch.setattr(smtplib, "SMTP", explode)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", explode)
 
     await send_verification_email("member@example.com", "tok999", "Ana")
 
     printed = capsys.readouterr().out
     assert "MOCK EMAIL SENT TO: member@example.com" in printed
-    assert "Resend" not in printed
 
 
 # ==========================================
@@ -274,15 +285,16 @@ async def test_from_header_is_the_authenticated_account(smtp, monkeypatch):
     """
     Gmail refuses to relay a From header for an address it does not own.
 
-    EMAIL_FROM defaults to Resend's onboarding@resend.dev, so honouring it here
-    would have every message rejected the moment the account switched to Gmail.
+    EMAIL_FROM is configured independently of the mailbox we authenticate as, so
+    honouring it here would have every message rejected the moment the two drift
+    apart. The From header has to come from SMTP_USER instead.
     """
-    monkeypatch.setattr(settings, "EMAIL_FROM", "onboarding@resend.dev")
+    monkeypatch.setattr(settings, "EMAIL_FROM", "someone-else@example.org")
 
     connection = await send_one()
 
     assert connection.message["From"] == "FitPass <gym@gmail.com>"
-    assert "resend.dev" not in connection.message["From"]
+    assert "example.org" not in connection.message["From"]
 
 
 @pytest.mark.asyncio
