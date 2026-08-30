@@ -144,7 +144,7 @@ services:
     restart: unless-stopped
 
     env_file:
-      # Secrets and optional settings: SECRET_KEY, STRIPE_*, RESEND/SMTP,
+      # Secrets and optional settings: SECRET_KEY, STRIPE_*, SMTP_*,
       # RECAPTCHA_SECRET, GYM_TIMEZONE...
       - .env.prod
 
@@ -234,7 +234,18 @@ services:
 
     ports:
       # host:container — the single door into the whole stack.
-      - "80:80"
+      #
+      # The left-hand side is a variable because the two deployments want
+      # different things from it (see FRONTEND_PUBLISH in .env.prod.example):
+      #
+      #   8080            → reachable from the host and the LAN. This is how you
+      #                     test the real production stack on your own machine.
+      #   127.0.0.1:8080  → loopback only. This is the server setting: the
+      #                     cloudflared container reaches Nginx over the Compose
+      #                     network as `frontend:80`, so the port never has to be
+      #                     open to the internet — and on Oracle Cloud you then
+      #                     do not have to punch a hole in the security list.
+      - "${FRONTEND_PUBLISH:-80}:80"
 
     depends_on:
       backend:
@@ -253,6 +264,50 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # ---------------------------------------------------------------------------
+  # THE TUNNEL (optional — only starts with `--profile tunnel`)
+  # ---------------------------------------------------------------------------
+  # cloudflared dials OUT to Cloudflare and holds the connection open, then
+  # Cloudflare hands it inbound requests over that same connection. Nothing
+  # listens on a public port, so there is no inbound firewall rule to open, no
+  # public IP to expose and no certificate to renew — TLS is terminated at
+  # Cloudflare's edge and the origin keeps speaking plain HTTP inside Docker.
+  #
+  # That is also why frontend/nginx.conf trusts X-Forwarded-Proto: the edge is
+  # the only thing that can reach it.
+  #
+  # `profiles` keeps it out of a plain `docker compose up`, so local testing
+  # never accidentally publishes the machine to the internet.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: fitpass_tunnel_prod
+    restart: unless-stopped
+
+    profiles: ["tunnel"]
+
+    environment:
+      # cloudflared reads TUNNEL_TOKEN natively. Passing it this way rather than
+      # as `--token <value>` keeps the credential out of the container's command
+      # line, where `docker ps` and the host process list would both show it.
+      #
+      # The `:-` default is load-bearing: Compose interpolates the ENTIRE file
+      # before it looks at profiles, so a `:?` guard here would break plain
+      # `docker compose up` — the local-test path that never wants a tunnel.
+      # With the token blank, cloudflared refuses to start and says so, and only
+      # this one container is affected.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+
+    # --no-autoupdate: the container is the unit of upgrade here. Letting the
+    # binary rewrite itself in place makes the running version untraceable.
+    command: tunnel --no-autoupdate run
+
+    depends_on:
+      frontend:
+        # Coming up before Nginx is ready would serve Cloudflare a 502 and
+        # cache the failure at the edge.
+        condition: service_healthy
+
 
 # --- NAMED VOLUMES -----------------------------------------------------------
 # Managed by Docker and independent of any container's lifetime.
