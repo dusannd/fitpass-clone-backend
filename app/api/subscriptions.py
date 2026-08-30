@@ -23,7 +23,7 @@ get_current_admin = RequireRole("admin")
 
 
 # ==========================================
-# 1. GYM LOCATIONS (ADMIN ONLY)
+# 1. GYM LOCATIONS (admin writes; any signed-in user may read the list)
 # ==========================================
 @router.post("/locations", response_model=GymLocationResponse)
 async def create_location(
@@ -44,11 +44,21 @@ async def create_location(
 @router.get("/locations", response_model=List[GymLocationResponse])
 async def get_locations(
         db: AsyncSession = Depends(get_db),
-        admin_id: int = Depends(get_current_admin)
+        user_id: int = Depends(get_current_user_id)
 ):
     """
-    Admin route: list all gym locations. Used by ManagePlans.tsx to build the
-    location checkboxes when creating/editing a plan.
+    List all gym locations. Any signed-in user, not just an admin.
+
+    ManagePlans.tsx builds its location checkboxes from this, but the desk worker
+    needs it too: the turnstile scanner and the desk panel used to make the worker
+    type a raw location id, with nothing on screen to say which gym id 3 actually
+    is. They hold RequireRole("worker"), so an admin gate answered them with a 403.
+
+    Widening it leaks nothing. GET /subscriptions/plans below is a genuinely public
+    route with no auth dependency at all, and it eager-loads the full nested
+    locations[] of every active plan - so gym names and addresses are already
+    readable by anyone who asks. The admin gate here was guarding a closed door in
+    an open wall. Writes (POST/PUT/DELETE) stay admin-only.
     """
     result = await db.execute(select(GymLocation))
     return result.scalars().all()
