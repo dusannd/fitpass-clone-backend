@@ -505,9 +505,9 @@ async def forgot_password(
 
     # 2. Security: the response never says whether the email exists. That only
     # holds if the RESPONSE TIME says nothing either - this used to await the
-    # send, which in production is a live HTTPS round trip to Resend. A known
-    # address took a few hundred milliseconds, an unknown one a few, and the
-    # generic message below could be defeated with a stopwatch.
+    # send, which in production is a live SMTP round trip. A known address took
+    # a few hundred milliseconds, an unknown one a few, and the generic message
+    # below could be defeated with a stopwatch.
     # Queueing the mail makes both branches return at the same speed.
     if user:
         reset_token = create_action_token(user.email, "reset_password")

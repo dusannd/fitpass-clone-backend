@@ -65,7 +65,7 @@ async def test_forgot_password_queues_email_instead_of_awaiting_it(monkeypatch):
 
     The response body is deliberately generic so nobody can tell a registered
     address from an unregistered one - but in production that await is a live
-    HTTPS round trip to Resend. A known address answered in a few hundred
+    SMTP round trip. A known address answered in a few hundred
     milliseconds and an unknown one in a few, so the whole protection could be
     defeated with a stopwatch and a wordlist.
 

@@ -284,3 +284,55 @@ async def test_perks_reach_the_public_pricing_endpoint(admin_client):
         assert listed["includes_trainer"] is True
         assert listed["allows_guest"] is True
         assert listed["has_towel_service"] is False
+
+@pytest.mark.asyncio
+async def test_plans_come_back_cheapest_first(admin_client):
+    """
+    Both plan listings order by price.
+
+    The pricing page renders the list in the order it arrives, so without an
+    ORDER BY the cards came out in whatever sequence the database returned - which
+    is how a 10000 VIP ended up sitting to the left of a 3000 Standard.
+
+    The three plans below are created deliberately OUT of price order, because
+    SQLite hands rows back in insertion order when nothing sorts them. That is what
+    makes this a real test rather than one that passes for free: revert the
+    order_by and the returned prices are 9000, 1000, 5000.
+
+    Other tests share this database, so the assertions filter down to just these
+    three plans by id rather than reading the whole list.
+    """
+    async with admin_client as ac:
+        marker = uuid.uuid4().hex[:6]
+        created = {}
+
+        for label, price in (("expensive", 9000), ("cheap", 1000), ("middle", 5000)):
+            res = await ac.post("/api/subscriptions/plans", json={
+                "name": f"{label} {marker}",
+                "price": price,
+                "duration_days": 30,
+                "tier": "Standard",
+            })
+            assert res.status_code == 200
+            created[res.json()["id"]] = price
+
+        # --- 1. THE PUBLIC PRICING ENDPOINT ---
+        res_public = await ac.get("/api/subscriptions/plans")
+        assert res_public.status_code == 200
+
+        public_prices = [p["price"] for p in res_public.json() if p["id"] in created]
+        assert public_prices == [1000, 5000, 9000]
+
+        # --- 2. THE ADMIN LISTING ---
+        res_all = await ac.get("/api/subscriptions/plans/all")
+        assert res_all.status_code == 200
+
+        admin_prices = [p["price"] for p in res_all.json() if p["id"] in created]
+        assert admin_prices == [1000, 5000, 9000]
+
+        # --- 3. THE WHOLE LIST IS ORDERED, NOT JUST OUR SLICE ---
+        # A sort that only happened to work for three fresh rows would not help the
+        # real page, which renders every active plan.
+        all_public_prices = [p["price"] for p in res_public.json()]
+        assert all_public_prices == sorted(all_public_prices)
+
