@@ -12,6 +12,9 @@ Built on FastAPI and Async PostgreSQL — engineered for security, high concurre
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
 [![Version](https://img.shields.io/badge/version-4.2.1-blueviolet.svg?style=flat)]()
 [![License](https://img.shields.io/badge/license-AGPLv3-green.svg?style=flat)](./LICENSE)
+[![Live](https://img.shields.io/badge/live-fitpassclone.top-brightgreen.svg?style=flat&logo=cloudflare&logoColor=white)](https://fitpassclone.top)
+ 
+**Live at [fitpassclone.top](https://fitpassclone.top)** — the full production stack (Nginx, this API, PostgreSQL and Redis) running behind a Cloudflare Tunnel.
  
 </div>
 ---
