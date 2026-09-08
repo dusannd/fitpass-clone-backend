@@ -209,11 +209,13 @@ services:
   # --- 5. THE SPA + REVERSE PROXY -------------------------------------------
   frontend:
     build:
-      # The frontend lives in a SEPARATE git repository which is not a sibling
-      # of this one, so there is no tidy relative path. The default below is
-      # correct for the original development machine; anyone else sets
-      # FRONTEND_PATH in .env.prod to point at their own checkout.
-      context: "${FRONTEND_PATH:-../../Front-End projekti/fitpass-clone-frontend}"
+      # The frontend lives in a SEPARATE git repository, so compose needs an
+      # explicit path to it. The default assumes the two repos are cloned side
+      # by side in the same parent folder, which is what a server checkout
+      # looks like - clone both into ~ and this works with no configuration.
+      # Anyone keeping them elsewhere (a development machine, typically) sets
+      # FRONTEND_PATH in .env.prod to an absolute path instead.
+      context: "${FRONTEND_PATH:-../fitpass-clone-frontend}"
       dockerfile: Dockerfile.prod
 
       args:

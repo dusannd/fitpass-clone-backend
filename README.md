@@ -10,7 +10,7 @@ Built on FastAPI and Async PostgreSQL — engineered for security, high concurre
 [![Redis](https://img.shields.io/badge/Redis-Caching-DC382D.svg?style=flat&logo=redis)](https://redis.io/)
 [![Stripe](https://img.shields.io/badge/Stripe-Payments-008CDD.svg?style=flat&logo=stripe)](https://stripe.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/version-4.2.0-blueviolet.svg?style=flat)]()
+[![Version](https://img.shields.io/badge/version-4.2.1-blueviolet.svg?style=flat)]()
 [![License](https://img.shields.io/badge/license-AGPLv3-green.svg?style=flat)](./LICENSE)
  
 </div>
@@ -58,6 +58,8 @@ Version 4.2 takes the platform from "runs on my machine" to a deployable product
 - **Transactional Email Pipeline** — Branded HTML templates for verification and password reset, delivered over Gmail SMTP, with every link built from the configured `FRONTEND_URL` and every interpolated value HTML-escaped in a single render pass.
 - **Analytics on the Gym Clock** — MRR normalized to a 30-day window, 24-bucket peak-hour reporting, weekly breakdowns and a dedicated HR staff endpoint that filters roles in the database instead of paging through the user table. All time-of-day reporting converts UTC to gym-local before bucketing, and "today" is filtered on a half-open range so the timestamp index still applies.
 - **Defence in Depth** — Rate limiting moved to Redis with an in-memory fallback, so counters are shared across workers and survive a cache outage. Every 429 now carries `Retry-After`, unhandled errors return a generic 500 without losing CORS or security headers, and the email-enumeration timing leak on password reset was closed by queuing the mail as a background task.
+
+**4.2.1** — Gmail SMTP is now the only mail provider (the Resend integration and its dependency are gone), subscription plans are ordered by price rather than insertion, the gym location list is readable by any signed-in user so the frontend can offer a picker instead of asking for an id, and the stack ships with an optional `cloudflared` service plus `scripts/backup.sh` / `scripts/restore.sh`.
  
 ---
  
