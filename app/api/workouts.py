@@ -1,16 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from sqlalchemy import delete, insert
+from sqlalchemy import delete, insert, func
 from typing import List
 
 from app.core.database import get_db
 from app.api.dependencies import RequireRole
 from app.models.user import User, Role
 from app.schemas.user import UserResponse
-from app.models.workout import WorkoutPlan, WorkoutSession, ExerciseLog, user_dismissed_plans
-from app.schemas.workout import WorkoutPlanResponse, WorkoutSessionCreate, WorkoutSessionResponse
+from app.models.workout import WorkoutPlan, WorkoutSession, Exercise, ExerciseLog, user_dismissed_plans
+from app.schemas.workout import WorkoutPlanResponse, WorkoutSessionCreate, WorkoutSessionResponse, WorkoutHistoryPage, ProgressPoint
 
 router = APIRouter()
 
@@ -321,16 +321,25 @@ async def log_workout_session(
     return result.scalars().first()
 
 
-@router.get("/history", response_model=List[WorkoutSessionResponse])
+@router.get("/history", response_model=WorkoutHistoryPage)
 async def get_workout_history(
-        skip: int = 0,
-        limit: int = 10,
+        skip: int = Query(0, ge=0),
+        limit: int = Query(10, ge=1, le=50),
         db: AsyncSession = Depends(get_db),
         member_id: int = Depends(get_current_member)
 ):
     """
-    Member App: Fetch the user's workout history (useful for plotting progress charts).
+    Member App: One page of the user's workout history, newest first.
+
+    This used to return a bare list capped at 10, and the frontend asked without
+    paging - so the history list AND the strength chart silently stopped at the last
+    ten workouts. The chart now has its own endpoint (/progress) and this one pages
+    properly, with `total` telling the frontend whether there is more.
     """
+    total = (await db.execute(
+        select(func.count(WorkoutSession.id)).where(WorkoutSession.user_id == member_id)
+    )).scalar_one()
+
     stmt = (
         select(WorkoutSession)
         .options(
@@ -338,9 +347,45 @@ async def get_workout_history(
             .selectinload(ExerciseLog.exercise)
         )
         .where(WorkoutSession.user_id == member_id)
-        .order_by(WorkoutSession.date.desc())
+        # id breaks ties: two sessions logged in the same second must not swap
+        # places between pages (see CLAUDE.md on stable paging).
+        .order_by(WorkoutSession.date.desc(), WorkoutSession.id.desc())
         .offset(skip)
         .limit(limit)
     )
     result = await db.execute(stmt)
-    return result.scalars().all()
+    return {"total": total, "items": result.scalars().all()}
+
+
+@router.get("/progress", response_model=List[ProgressPoint])
+async def get_workout_progress(
+        db: AsyncSession = Depends(get_db),
+        member_id: int = Depends(get_current_member)
+):
+    """
+    Member App: Every point of the strength chart, over the member's WHOLE history.
+
+    One row per (session, exercise): the heaviest weighted set, worked out by the
+    database. That is all the chart draws, so it covers years of training without
+    shipping every single set the way paging through /history would.
+    """
+    stmt = (
+        select(
+            WorkoutSession.id.label("session_id"),
+            WorkoutSession.date,
+            Exercise.id.label("exercise_id"),
+            Exercise.name.label("exercise_name"),
+            func.max(ExerciseLog.weight_kg).label("top_weight_kg"),
+        )
+        .join(ExerciseLog, ExerciseLog.session_id == WorkoutSession.id)
+        # Inner join: a set whose exercise is gone has no name to chart it under.
+        .join(Exercise, Exercise.id == ExerciseLog.exercise_id)
+        .where(
+            WorkoutSession.user_id == member_id,
+            ExerciseLog.weight_kg > 0,
+        )
+        .group_by(WorkoutSession.id, WorkoutSession.date, Exercise.id, Exercise.name)
+        .order_by(WorkoutSession.date.asc(), WorkoutSession.id.asc())
+    )
+    result = await db.execute(stmt)
+    return [dict(row._mapping) for row in result.all()]

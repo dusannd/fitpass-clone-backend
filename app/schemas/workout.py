@@ -91,3 +91,24 @@ class WorkoutSessionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class WorkoutHistoryPage(BaseModel):
+    """
+    One page of a member's history. `total` is the whole history, not the page -
+    the frontend needs it to know whether "Load more" has anything left to load.
+    Same {total, items} shape as every other list endpoint.
+    """
+    total: int
+    items: List[WorkoutSessionResponse] = []
+
+
+class ProgressPoint(BaseModel):
+    """
+    The heaviest set of one exercise in one session - one point on the strength chart.
+    """
+    session_id: int
+    date: datetime
+    exercise_id: int
+    exercise_name: str
+    top_weight_kg: float

@@ -97,7 +97,8 @@ async def test_workout_logging_flow():
         res_history = await ac.get("/api/workouts/history", headers=member_headers)
         assert res_history.status_code == 200
 
-        history = res_history.json()
+        assert res_history.json()["total"] == 1
+        history = res_history.json()["items"]
 
         # Verify the session is in the history
         assert len(history) == 1
@@ -112,3 +113,83 @@ async def test_workout_logging_flow():
 
         # The personal record is the heaviest set of the exercise, not the last one
         assert max(log["weight_kg"] for log in exercise_logs) == 85.5
+
+
+async def member_with_plan(ac: AsyncClient) -> tuple[dict, int, int, int]:
+    """A trainer's public plan with one weighted and one bodyweight exercise, and a member."""
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    member_email = f"member_{uuid.uuid4().hex[:6]}@test.com"
+    password = "password123"
+
+    await ac.post("/api/users/", json={"email": trainer_email, "password": password, "first_name": "T", "last_name": "T"})
+    try:
+        app.dependency_overrides[get_current_admin] = override_get_current_admin
+        await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
+    finally:
+        app.dependency_overrides.pop(get_current_admin, None)
+    res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
+    trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+    await ac.post("/api/users/", json={"email": member_email, "password": password, "first_name": "M", "last_name": "M"})
+    res = await ac.post("/api/users/login", json={"email": member_email, "password": password})
+    member_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+    res = await ac.post("/api/trainer/plans", json={
+        "name": "Paging plan", "description": "",
+        "exercises": [
+            {"name": "Deadlift", "sets": 3, "reps": "5"},
+            {"name": "Pull-up", "sets": 3, "reps": "8", "requires_weight": False},
+        ],
+    }, headers=trainer_headers)
+    plan = res.json()
+    return member_headers, plan["id"], plan["exercises"][0]["id"], plan["exercises"][1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_history_pages_through_everything():
+    """History used to stop at the last 10 sessions - the list AND the chart."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        member_headers, plan_id, deadlift_id, _ = await member_with_plan(ac)
+
+        for i in range(12):
+            res = await ac.post("/api/workouts/log-session", json={
+                "plan_id": plan_id, "notes": f"session {i}",
+                "exercises": [{"exercise_id": deadlift_id, "set_number": 1, "reps_completed": "5", "weight_kg": 100 + i}],
+            }, headers=member_headers)
+            assert res.status_code == 200, res.text
+
+        first = (await ac.get("/api/workouts/history?skip=0&limit=10", headers=member_headers)).json()
+        second = (await ac.get("/api/workouts/history?skip=10&limit=10", headers=member_headers)).json()
+
+        assert first["total"] == 12 and second["total"] == 12
+        assert len(first["items"]) == 10 and len(second["items"]) == 2
+
+        # Every session exactly once across the two pages.
+        ids = [s["id"] for s in first["items"] + second["items"]]
+        assert len(set(ids)) == 12
+
+
+@pytest.mark.asyncio
+async def test_progress_gives_the_top_set_of_every_session():
+    """The chart's data: the heaviest set per session and exercise, for the whole history."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        member_headers, plan_id, deadlift_id, pullup_id = await member_with_plan(ac)
+
+        for weights in ([100, 120, 110], [125, 115, 0]):
+            await ac.post("/api/workouts/log-session", json={
+                "plan_id": plan_id, "notes": "",
+                "exercises": [
+                    {"exercise_id": deadlift_id, "set_number": n + 1, "reps_completed": "5", "weight_kg": w}
+                    for n, w in enumerate(weights)
+                ] + [
+                    # Bodyweight sets carry no weight and must not show up on the chart.
+                    {"exercise_id": pullup_id, "set_number": 1, "reps_completed": "8", "weight_kg": None},
+                ],
+            }, headers=member_headers)
+
+        res = await ac.get("/api/workouts/progress", headers=member_headers)
+        assert res.status_code == 200, res.text
+        points = res.json()
+
+        assert [p["exercise_name"] for p in points] == ["Deadlift", "Deadlift"]
+        assert [p["top_weight_kg"] for p in points] == [120, 125]
