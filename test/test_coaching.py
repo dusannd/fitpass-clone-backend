@@ -370,3 +370,92 @@ async def test_booking_is_refused_after_the_perk_goes_away(seed_subscription, ex
         # 3. The link itself is untouched - the trainer still has this client.
         res_clients = await ac.get("/api/coaching/clients", headers=trainer_headers)
         assert any(c["client_id"] == member_id for c in res_clients.json())
+
+
+# ==========================================
+# ASKING AGAIN AFTER A REJECTION
+# ==========================================
+
+async def reject_pending(ac, trainer_headers, member_id) -> int:
+    """The trainer rejects this member's pending request; returns the link id."""
+    res = await ac.get("/api/coaching/requests", headers=trainer_headers)
+    link_id = next(r["id"] for r in res.json() if r["client_id"] == member_id)
+    res = await ac.put(f"/api/coaching/requests/{link_id}", json={"status": "REJECTED"}, headers=trainer_headers)
+    assert res.status_code == 200, res.text
+    return link_id
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_member_can_ask_again(seed_subscription):
+    """One "no" used to lock that trainer away for good - the re-request was a 400."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer_id, member_id, member_headers, trainer_headers = await setup_trainer_and_member(ac)
+        await seed_subscription(member_id, includes_trainer=True)
+
+        await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        await reject_pending(ac, trainer_headers, member_id)
+
+        res = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        assert res.status_code == 200, res.text
+
+        # The trainer sees it as a fresh pending request again.
+        res = await ac.get("/api/coaching/requests", headers=trainer_headers)
+        assert any(r["client_id"] == member_id for r in res.json())
+
+
+@pytest.mark.asyncio
+async def test_three_rejections_in_a_row_mean_a_week_off(seed_subscription, age_coaching_response):
+    """After the third "no" the member waits 7 days; after that they get three more tries."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer_id, member_id, member_headers, trainer_headers = await setup_trainer_and_member(ac)
+        await seed_subscription(member_id, includes_trainer=True)
+
+        link_id = None
+        for _ in range(3):
+            res = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+            assert res.status_code == 200, res.text
+            link_id = await reject_pending(ac, trainer_headers, member_id)
+
+        # 4th try: banned, and told until when.
+        res = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        assert res.status_code == 429
+        assert "again on" in res.json()["detail"]
+
+        # The frontend gets the same date to grey the button out with.
+        res = await ac.get("/api/coaching/my-trainers", headers=member_headers)
+        link = next(l for l in res.json() if l["trainer_id"] == trainer_id)
+        assert link["status"] == "REJECTED"
+        assert link["rejection_count"] == 3
+        assert link["retry_after"] is not None
+
+        # A week and a day later the ban is over...
+        await age_coaching_response(link_id, days=8)
+        res = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        assert res.status_code == 200, res.text
+
+        # ...and the count starts afresh, so ONE more "no" is not another ban.
+        await reject_pending(ac, trainer_headers, member_id)
+        res = await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        assert res.status_code == 200, res.text
+
+
+@pytest.mark.asyncio
+async def test_an_answered_request_cannot_be_answered_again(seed_subscription):
+    """Replaying the call used to flip an ACCEPTED client to REJECTED."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer_id, member_id, member_headers, trainer_headers = await setup_trainer_and_member(ac)
+        await seed_subscription(member_id, includes_trainer=True)
+
+        await ac.post(f"/api/coaching/request/{trainer_id}", headers=member_headers)
+        res = await ac.get("/api/coaching/requests", headers=trainer_headers)
+        link_id = next(r["id"] for r in res.json() if r["client_id"] == member_id)
+
+        res = await ac.put(f"/api/coaching/requests/{link_id}", json={"status": "ACCEPTED"}, headers=trainer_headers)
+        assert res.status_code == 200
+
+        res = await ac.put(f"/api/coaching/requests/{link_id}", json={"status": "REJECTED"}, headers=trainer_headers)
+        assert res.status_code == 409
+
+        # Still their trainer.
+        res = await ac.get("/api/coaching/clients", headers=trainer_headers)
+        assert any(c["client_id"] == member_id for c in res.json())

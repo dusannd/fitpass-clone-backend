@@ -41,6 +41,11 @@ class TrainerClientLinkResponse(BaseModel):
     status: str
     created_at: datetime
 
+    # Rejections in a row, and - once they hit the limit - when the member may ask
+    # again (None when nothing stops them). retry_after is a property on the model.
+    rejection_count: int = 0
+    retry_after: Optional[datetime] = None
+
     # Koristimo našu laganu šemu umesto teškog UserResponse
     client: Optional[CoachingUser] = None
     trainer: Optional[CoachingUser] = None

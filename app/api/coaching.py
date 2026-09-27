@@ -147,11 +147,35 @@ async def request_coaching(
     existing_link_result = await db.execute(existing_link_stmt)
     existing_link = existing_link_result.scalars().first()
 
-    if existing_link:
+    if existing_link and existing_link.status != "REJECTED":
         raise HTTPException(
             status_code=400,
             detail=f"Request already exists with status: {existing_link.status}"
         )
+
+    # 2b. A rejected member may ask again. This used to be refused forever with the
+    #     same 400 as above, so one "no" locked that trainer away for good. Asking
+    #     again is free until MAX_CONSECUTIVE_REJECTIONS in a row; after that the
+    #     member waits REJECTION_COOLDOWN_DAYS from the last rejection.
+    if existing_link:
+        retry_after = existing_link.retry_after
+        if retry_after is not None:
+            name = trainer.first_name or "this trainer"
+            raise HTTPException(
+                status_code=429,
+                detail=f"You can ask {name} again on {to_gym_time(retry_after):%d %b %Y}."
+            )
+
+        # The ban has run out: start counting afresh, so the member gets the same
+        # number of tries again rather than being banned by the very next "no".
+        if existing_link.rejection_count >= settings.MAX_CONSECUTIVE_REJECTIONS:
+            existing_link.rejection_count = 0
+
+        # Reuse the row: there is one link per trainer/member pair.
+        existing_link.status = "PENDING"
+        db.add(existing_link)
+        await db.commit()
+        return {"status": "success", "message": "Coaching request sent successfully"}
 
     # 3. Create a new pending request
     new_request = TrainerClientLink(
@@ -212,8 +236,22 @@ async def respond_to_request(
     if not link:
         raise HTTPException(status_code=404, detail="Request not found")
 
-    # Update the status
+    # Only an open request can be answered. Nothing checked this before, so replaying
+    # the call could flip an ACCEPTED client to REJECTED (or count one rejection twice).
+    if link.status != "PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This request was already {link.status.lower()}."
+        )
+
+    # Update the status, and keep count of rejections in a row - that is what the
+    # re-request cooldown in request_coaching reads.
     link.status = payload.status
+    link.responded_at = datetime.now(timezone.utc)
+    if payload.status == "REJECTED":
+        link.rejection_count = (link.rejection_count or 0) + 1
+    else:
+        link.rejection_count = 0
     db.add(link)
     await db.commit()
 

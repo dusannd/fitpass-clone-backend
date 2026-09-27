@@ -9,7 +9,7 @@ from app.api.helpers import gym_timezone
 from app.main import app
 from app.core.config import settings
 from app.core.rate_limit import limiter
-from app.models.coaching import Appointment
+from app.models.coaching import Appointment, TrainerClientLink
 from app.models.access import EntryLog
 from app.models.subscription import GymLocation, SubscriptionPlan, SubscriptionRule, UserSubscription
 from app.models.user import User, Role
@@ -99,6 +99,28 @@ def reschedule_appointment():
             await session.commit()
 
     return _reschedule
+
+
+@pytest.fixture
+def age_coaching_response():
+    """
+    Moves a trainer's last answer to a coaching request `days` into the past.
+
+    The re-request cooldown is counted from responded_at, and no endpoint can set
+    it to anything but "now" - so this is the only way to test the ban running out.
+    """
+    async def _age(link_id: int, days: int):
+        async with TestingSessionLocal() as session:
+            link = (await session.execute(
+                select(TrainerClientLink).where(TrainerClientLink.id == link_id)
+            )).scalars().first()
+
+            link.responded_at = datetime.now(timezone.utc) - timedelta(days=days)
+
+            session.add(link)
+            await session.commit()
+
+    return _age
 
 
 @pytest.fixture

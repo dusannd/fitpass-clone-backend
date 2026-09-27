@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # slot at the last minute.
     MEMBER_CANCEL_CUTOFF_HOURS: int = 12
 
+    # A member a trainer rejected may ask again right away - but after this many
+    # rejections in a row they wait REJECTION_COOLDOWN_DAYS before the next try.
+    MAX_CONSECUTIVE_REJECTIONS: int = 3
+    REJECTION_COOLDOWN_DAYS: int = 7
+
     TESTING: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
