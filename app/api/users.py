@@ -139,6 +139,9 @@ async def get_all_users(
             selectinload(User.subscriptions),
             selectinload(User.profile)  # NEW: eager load so we don't fire N+1 queries
         )
+        # Paging needs a fixed order. Without one, Postgres is free to return rows in
+        # any order per query, so a user could turn up on two pages and another on none.
+        .order_by(User.id)
         .offset(skip)
         .limit(limit)
     )

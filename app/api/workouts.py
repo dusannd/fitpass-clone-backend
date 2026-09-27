@@ -79,8 +79,16 @@ async def follow_workout_plan(
     plan_result = await db.execute(select(WorkoutPlan).where(WorkoutPlan.id == plan_id))
     plan = plan_result.scalars().first()
 
-    if not plan:
+    # A private plan is a trainer's plan for ONE client. Anyone else following it by
+    # id (ids are sequential, so easy to guess) used to get the whole thing back
+    # through /my-plans. To everyone else it simply does not exist - a 404, not a
+    # 403, so the id cannot even be confirmed.
+    if not plan or (plan.client_id is not None and plan.client_id != member_id):
         raise HTTPException(status_code=404, detail="Workout plan not found.")
+
+    # The client it was made for already has it under /my-private-plans.
+    if plan.client_id == member_id:
+        raise HTTPException(status_code=400, detail="This plan is already in your plans.")
 
     # 3. Check if already following to prevent duplicates
     if any(p.id == plan_id for p in user.saved_plans):
@@ -257,6 +265,27 @@ async def log_workout_session(
     """
     Member App: Log a completed workout session, one entry per set that was actually performed.
     """
+    # 0. VALIDATE WHAT IS BEING LOGGED.
+    # Nothing was checked before, and the response embeds each set's exercise - so
+    # logging made-up exercise ids read back exercises out of other members'
+    # private plans, and anyone's history could be filled with sets they never did.
+    if not payload.exercises:
+        raise HTTPException(status_code=400, detail="A session needs at least one completed set.")
+
+    plan_result = await db.execute(
+        select(WorkoutPlan).options(selectinload(WorkoutPlan.exercises)).where(WorkoutPlan.id == payload.plan_id)
+    )
+    plan = plan_result.scalars().first()
+
+    # Public plans are open to every member; a private one only to its client.
+    # Someone else's private plan is a 404, same as follow, so ids can't be probed.
+    if not plan or (plan.client_id is not None and plan.client_id != member_id):
+        raise HTTPException(status_code=404, detail="Workout plan not found.")
+
+    plan_exercise_ids = {ex.id for ex in plan.exercises}
+    if any(log.exercise_id not in plan_exercise_ids for log in payload.exercises):
+        raise HTTPException(status_code=400, detail="Every set must belong to an exercise of this plan.")
+
     # 1. Create the parent session
     new_session = WorkoutSession(
         user_id=member_id,

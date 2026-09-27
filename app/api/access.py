@@ -202,19 +202,32 @@ async def scan_qr_code(
                              "Replay Attack: Token already consumed.")
         raise HTTPException(status_code=403, detail="Code already used. Screenshots are strictly forbidden.")
 
+    async def refuse(log_reason: str, detail: str) -> HTTPException:
+        """
+        Logs a refusal and hands the code back before the caller raises.
+
+        The burn above has to happen first - SET NX is what stops two scans of one
+        code in the same instant from both getting through. But a code the door
+        then REFUSES (passback, no pass, wrong location or hour) never opened
+        anything, and keeping it burned meant the member's retry was answered with
+        "Screenshots are strictly forbidden", which reads as an accusation. Freeing
+        the jti lets the same code be scanned again once the problem is sorted.
+        """
+        await redis_db.delete(jti_key)
+        await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type, log_reason)
+        return HTTPException(status_code=403, detail=detail)
+
     # 3. REDIS ANTI-PASSBACK
     redis_key = f"user_status:{user_id}"
     current_status = await resolve_user_status(db, user_id, redis_key)
 
     if action_type == "ENTRY" and current_status == "INSIDE":
-        await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                             "Anti-Passback Violation: Already inside.")
-        raise HTTPException(status_code=403, detail="Passback Error: You are already inside the gym.")
+        raise await refuse("Anti-Passback Violation: Already inside.",
+                           "Passback Error: You are already inside the gym.")
 
     if action_type == "EXIT" and current_status == "OUTSIDE":
-        await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                             "Anti-Passback Violation: Not checked in.")
-        raise HTTPException(status_code=403, detail="Passback Error: You cannot exit if you haven't entered.")
+        raise await refuse("Anti-Passback Violation: Not checked in.",
+                           "Passback Error: You cannot exit if you haven't entered.")
 
     # 4. CHECK SUBSCRIPTION VALIDITY (ONLY FOR ENTRY)
     if action_type == "ENTRY":
@@ -247,9 +260,7 @@ async def scan_qr_code(
         active_sub = result.scalars().first()
 
         if not active_sub:
-            await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type,
-                                 "No active subscription found.")
-            raise HTTPException(status_code=403, detail="Access Denied: No active subscription.")
+            raise await refuse("No active subscription found.", "Access Denied: No active subscription.")
 
         # 4a. LOCATION + TIME/DAY RULE CHECK.
         #     The rules themselves now live in app/api/entry_policy.py, because the
@@ -261,8 +272,7 @@ async def scan_qr_code(
         denial = check_entry_policy(active_sub.plan, payload.location_id, now)
         if denial:
             log_reason, http_detail = ENTRY_DENIAL_MESSAGES[denial]
-            await log_and_notify(db, user_id, worker_id, payload.location_id, False, action_type, log_reason)
-            raise HTTPException(status_code=403, detail=http_detail)
+            raise await refuse(log_reason, http_detail)
 
     # 5. SUCCESS: UPDATE REDIS STATE & LOG
     new_status = "INSIDE" if action_type == "ENTRY" else "OUTSIDE"
