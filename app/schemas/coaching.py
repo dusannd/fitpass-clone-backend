@@ -82,4 +82,5 @@ class AppointmentResponse(BaseModel):
     trainer: Optional[CoachingUser] = None
     client: Optional[CoachingUser] = None
 
-model_config = ConfigDict(from_attributes=True)
+    # Was at module level below the class, where it configured nothing.
+    model_config = ConfigDict(from_attributes=True)

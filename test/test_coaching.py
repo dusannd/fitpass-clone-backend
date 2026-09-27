@@ -327,7 +327,7 @@ async def test_request_is_allowed_with_the_trainer_perk(seed_subscription):
 
 
 @pytest.mark.asyncio
-async def test_booking_is_refused_after_the_perk_goes_away(seed_subscription, expire_subscription):
+async def test_booking_is_refused_after_the_perk_goes_away(seed_subscription, expire_subscription, gym_slot):
     """
     The gate is on booking too, not only on the request.
 
@@ -357,7 +357,7 @@ async def test_booking_is_refused_after_the_perk_goes_away(seed_subscription, ex
         # 2. The pass lapses. Same member, same ACCEPTED link, no entitlement.
         await expire_subscription(sub_id)
 
-        start_time = datetime.now(timezone.utc) + timedelta(days=3)
+        start_time = gym_slot(3)
         res_booking = await ac.post("/api/coaching/appointments", json={
             "trainer_id": trainer_id,
             "start_time": start_time.isoformat(),

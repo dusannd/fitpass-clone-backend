@@ -12,7 +12,7 @@ async def override_get_current_admin():
 
 
 @pytest.mark.asyncio
-async def test_appointment_scheduling_flow(backdate_appointment, seed_subscription):
+async def test_appointment_scheduling_flow(backdate_appointment, seed_subscription, gym_slot):
     """
     INTEGRATION TEST (Appointments):
     1. Register Trainer and Client.
@@ -62,7 +62,7 @@ async def test_appointment_scheduling_flow(backdate_appointment, seed_subscripti
 
         # --- 3. TEST FAIL: UNAUTHORIZED APPOINTMENT ---
         # Try to schedule with a fake trainer ID
-        start_time = datetime.now(timezone.utc) + timedelta(days=1)
+        start_time = gym_slot(1)
         end_time = start_time + timedelta(hours=1)
 
         payload = {
@@ -110,7 +110,7 @@ async def test_appointment_scheduling_flow(backdate_appointment, seed_subscripti
 
 
 @pytest.mark.asyncio
-async def test_cancelling_a_future_session_is_allowed(seed_subscription):
+async def test_cancelling_a_future_session_is_allowed(seed_subscription, gym_slot):
     """
     The COMPLETED guard must not leak into CANCELLED: cancelling a session that
     hasn't happened yet is the normal, expected case.
@@ -151,7 +151,7 @@ async def test_cancelling_a_future_session_is_allowed(seed_subscription):
         await ac.put(f"/api/coaching/requests/{request_id}", json={"status": "ACCEPTED"}, headers=trainer_headers)
 
         # --- 2. BOOK A FUTURE SESSION ---
-        start_time = datetime.now(timezone.utc) + timedelta(days=3)
+        start_time = gym_slot(3)
         res_appt = await ac.post("/api/coaching/appointments", json={
             "trainer_id": trainer_id,
             "start_time": start_time.isoformat(),
@@ -170,7 +170,7 @@ async def test_cancelling_a_future_session_is_allowed(seed_subscription):
 
 
 @pytest.mark.asyncio
-async def test_status_change_preserves_existing_notes(backdate_appointment, seed_subscription):
+async def test_status_change_preserves_existing_notes(backdate_appointment, seed_subscription, gym_slot):
     """
     Feedback is shown to the member as "Trainer's Note", so a later status change
     must not erase it. Omitting the key leaves it; an explicit null clears it.
@@ -211,7 +211,7 @@ async def test_status_change_preserves_existing_notes(backdate_appointment, seed
         await ac.put(f"/api/coaching/requests/{request_id}", json={"status": "ACCEPTED"}, headers=trainer_headers)
 
         # --- 2. BOOK, BACKDATE, THEN COMPLETE WITH FEEDBACK ---
-        start_time = datetime.now(timezone.utc) + timedelta(days=1)
+        start_time = gym_slot(1)
         res_appt = await ac.post("/api/coaching/appointments", json={
             "trainer_id": trainer_id,
             "start_time": start_time.isoformat(),
@@ -226,18 +226,20 @@ async def test_status_change_preserves_existing_notes(backdate_appointment, seed
                                 headers=trainer_headers)
         assert res_done.json()["notes"] == "Squat form much improved."
 
-        # --- 3. A STATUS CHANGE WITH NO NOTES KEY MUST LEAVE THEM ALONE ---
+        # --- 3. AN UPDATE WITH NO NOTES KEY MUST LEAVE THEM ALONE ---
+        # Same status again: a closed session can no longer change status, but the
+        # trainer can still resend it to edit the feedback.
         res_keep = await ac.put(f"/api/coaching/appointments/{appointment_id}",
-                                json={"status": "CANCELLED"},
+                                json={"status": "COMPLETED"},
                                 headers=trainer_headers)
 
         assert res_keep.status_code == 200
-        assert res_keep.json()["status"] == "CANCELLED"
+        assert res_keep.json()["status"] == "COMPLETED"
         assert res_keep.json()["notes"] == "Squat form much improved."
 
         # --- 4. AN EXPLICIT NULL IS A DELIBERATE ERASE, SO IT STILL WORKS ---
         res_clear = await ac.put(f"/api/coaching/appointments/{appointment_id}",
-                                 json={"status": "CANCELLED", "notes": None},
+                                 json={"status": "COMPLETED", "notes": None},
                                  headers=trainer_headers)
 
         assert res_clear.status_code == 200
@@ -245,7 +247,7 @@ async def test_status_change_preserves_existing_notes(backdate_appointment, seed
 
 
 @pytest.mark.asyncio
-async def test_booking_horizon_is_enforced(seed_subscription):
+async def test_booking_horizon_is_enforced(seed_subscription, gym_slot):
     """
     A member must not be able to park a slot years out. 60 days is the cap, so a
     booking 61 days ahead is rejected while one inside the window succeeds.
@@ -286,7 +288,7 @@ async def test_booking_horizon_is_enforced(seed_subscription):
         await ac.put(f"/api/coaching/requests/{request_id}", json={"status": "ACCEPTED"}, headers=trainer_headers)
 
         # --- 2. TOO FAR OUT: REJECTED ---
-        too_far = datetime.now(timezone.utc) + timedelta(days=61)
+        too_far = gym_slot(61)
         res_far = await ac.post("/api/coaching/appointments", json={
             "trainer_id": trainer_id,
             "start_time": too_far.isoformat(),
@@ -297,7 +299,7 @@ async def test_booking_horizon_is_enforced(seed_subscription):
         assert "60 days" in res_far.json()["detail"]
 
         # --- 3. JUST INSIDE THE WINDOW: ACCEPTED ---
-        inside = datetime.now(timezone.utc) + timedelta(days=59)
+        inside = gym_slot(59)
         res_ok = await ac.post("/api/coaching/appointments", json={
             "trainer_id": trainer_id,
             "start_time": inside.isoformat(),
@@ -305,3 +307,155 @@ async def test_booking_horizon_is_enforced(seed_subscription):
         }, headers=client_headers)
 
         assert res_ok.status_code == 200
+
+
+# ==========================================
+# BOOKING RULES + MEMBER CANCELLATION
+# ==========================================
+
+PASSWORD = "password123"
+
+
+async def make_trainer(ac: AsyncClient) -> tuple[int, dict]:
+    """Registers a user, hires them as a trainer, and returns (id, cookie headers)."""
+    email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    res = await ac.post("/api/users/", json={"email": email, "password": PASSWORD, "first_name": "T", "last_name": "T"})
+    trainer_id = res.json()["id"]
+    try:
+        app.dependency_overrides[get_current_admin] = override_get_current_admin
+        await ac.post("/api/admin/hr/hire", json={"email": email, "role_name": "trainer"})
+    finally:
+        app.dependency_overrides.pop(get_current_admin, None)
+    res = await ac.post("/api/users/login", json={"email": email, "password": PASSWORD})
+    return trainer_id, {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+
+async def make_member(ac: AsyncClient, seed_subscription) -> tuple[int, dict]:
+    """Registers a member whose plan includes personal training."""
+    email = f"client_{uuid.uuid4().hex[:6]}@test.com"
+    res = await ac.post("/api/users/", json={"email": email, "password": PASSWORD, "first_name": "C", "last_name": "C"})
+    client_id = res.json()["id"]
+    await seed_subscription(client_id, includes_trainer=True)
+    res = await ac.post("/api/users/login", json={"email": email, "password": PASSWORD})
+    return client_id, {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+
+async def link(ac: AsyncClient, trainer: tuple[int, dict], client_headers: dict) -> None:
+    """Member requests the trainer, trainer accepts."""
+    trainer_id, trainer_headers = trainer
+    await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
+    res = await ac.get("/api/coaching/requests", headers=trainer_headers)
+    request_id = res.json()[0]["id"]
+    await ac.put(f"/api/coaching/requests/{request_id}", json={"status": "ACCEPTED"}, headers=trainer_headers)
+
+
+async def book(ac: AsyncClient, trainer_id: int, client_headers: dict, start: datetime, hours: float = 1):
+    return await ac.post("/api/coaching/appointments", json={
+        "trainer_id": trainer_id,
+        "start_time": start.isoformat(),
+        "end_time": (start + timedelta(hours=hours)).isoformat(),
+    }, headers=client_headers)
+
+
+@pytest.mark.asyncio
+async def test_a_closed_session_cannot_change_status(backdate_appointment, seed_subscription, gym_slot):
+    """COMPLETED and CANCELLED are final - a finished session must not become CANCELLED."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer = await make_trainer(ac)
+        _, client_headers = await make_member(ac, seed_subscription)
+        await link(ac, trainer, client_headers)
+
+        appointment_id = (await book(ac, trainer[0], client_headers, gym_slot(2))).json()["id"]
+        await backdate_appointment(appointment_id)
+
+        res = await ac.put(f"/api/coaching/appointments/{appointment_id}",
+                           json={"status": "COMPLETED"}, headers=trainer[1])
+        assert res.status_code == 200
+
+        res = await ac.put(f"/api/coaching/appointments/{appointment_id}",
+                           json={"status": "CANCELLED"}, headers=trainer[1])
+        assert res.status_code == 409
+        assert "already completed" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_double_book_across_trainers(seed_subscription, gym_slot):
+    """Only the trainer's calendar used to be checked, so the same hour could be booked twice."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        first = await make_trainer(ac)
+        second = await make_trainer(ac)
+        _, client_headers = await make_member(ac, seed_subscription)
+        await link(ac, first, client_headers)
+        await link(ac, second, client_headers)
+
+        start = gym_slot(4, hour=10)
+        assert (await book(ac, first[0], client_headers, start)).status_code == 200
+
+        # Half an hour into the first session, with the other trainer.
+        res = await book(ac, second[0], client_headers, start + timedelta(minutes=30))
+        assert res.status_code == 409
+        assert "You already have" in res.json()["detail"]
+
+        # Right after it is fine - touching ends do not overlap.
+        assert (await book(ac, second[0], client_headers, start + timedelta(hours=1))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_booking_must_fit_opening_hours(seed_subscription, gym_slot):
+    """06:00-23:00 on the gym's clock: before opening and past closing are refused."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer = await make_trainer(ac)
+        _, client_headers = await make_member(ac, seed_subscription)
+        await link(ac, trainer, client_headers)
+
+        too_early = await book(ac, trainer[0], client_headers, gym_slot(5, hour=5))
+        assert too_early.status_code == 400
+        assert "between 06:00 and 23:00" in too_early.json()["detail"]
+
+        # Starts at 22:30, ends 23:30 - past closing.
+        too_late = await book(ac, trainer[0], client_headers, gym_slot(5, hour=22) + timedelta(minutes=30))
+        assert too_late.status_code == 400
+
+        # The edges themselves are allowed.
+        assert (await book(ac, trainer[0], client_headers, gym_slot(5, hour=6))).status_code == 200
+        assert (await book(ac, trainer[0], client_headers, gym_slot(5, hour=22))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_member_can_cancel_outside_the_cutoff_only(reschedule_appointment, backdate_appointment,
+                                                         seed_subscription, gym_slot):
+    """A member cancels up to 12h before. Inside that, a stranger's, or a closed one is refused."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        trainer = await make_trainer(ac)
+        _, client_headers = await make_member(ac, seed_subscription)
+        _, stranger_headers = await make_member(ac, seed_subscription)
+        await link(ac, trainer, client_headers)
+
+        now = datetime.now(timezone.utc)
+        early = (await book(ac, trainer[0], client_headers, gym_slot(6, hour=9))).json()["id"]
+        late = (await book(ac, trainer[0], client_headers, gym_slot(6, hour=12))).json()["id"]
+        done = (await book(ac, trainer[0], client_headers, gym_slot(6, hour=15))).json()["id"]
+
+        # A stranger gets 404, so appointment ids cannot be probed.
+        res = await ac.post(f"/api/coaching/appointments/{early}/cancel", headers=stranger_headers)
+        assert res.status_code == 404
+
+        # 13 hours out: allowed.
+        await reschedule_appointment(early, now + timedelta(hours=13))
+        res = await ac.post(f"/api/coaching/appointments/{early}/cancel", headers=client_headers)
+        assert res.status_code == 200, res.text
+        assert res.json()["status"] == "CANCELLED"
+        assert res.json()["trainer"]["id"] == trainer[0]
+
+        # 11 hours out: only the trainer can cancel now.
+        await reschedule_appointment(late, now + timedelta(hours=11))
+        res = await ac.post(f"/api/coaching/appointments/{late}/cancel", headers=client_headers)
+        assert res.status_code == 400
+        assert "ask your trainer" in res.json()["detail"]
+
+        # Already completed: nothing to cancel.
+        await backdate_appointment(done)
+        await ac.put(f"/api/coaching/appointments/{done}", json={"status": "COMPLETED"}, headers=trainer[1])
+        await reschedule_appointment(done, now + timedelta(days=2))
+        res = await ac.post(f"/api/coaching/appointments/{done}/cancel", headers=client_headers)
+        assert res.status_code == 409

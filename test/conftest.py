@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import StaticPool
 from app.core.database import Base, get_db
+from app.api.helpers import gym_timezone
 from app.main import app
 from app.core.config import settings
 from app.core.rate_limit import limiter
@@ -73,6 +74,48 @@ def backdate_appointment():
             await session.commit()
 
     return _backdate
+
+
+@pytest.fixture
+def reschedule_appointment():
+    """
+    Moves an appointment to an exact start time, straight through the database.
+
+    The member-cancel cutoff is measured from NOW ("11 hours to go"), and a booking
+    made through the API can only land inside opening hours - so at 20:00 there is
+    no bookable slot 11 hours away. Moving the row directly makes those tests
+    independent of the time of day they happen to run at.
+    """
+    async def _reschedule(appointment_id: int, start_time: datetime):
+        async with TestingSessionLocal() as session:
+            appointment = (await session.execute(
+                select(Appointment).where(Appointment.id == appointment_id)
+            )).scalars().first()
+
+            appointment.start_time = start_time
+            appointment.end_time = start_time + timedelta(hours=1)
+
+            session.add(appointment)
+            await session.commit()
+
+    return _reschedule
+
+
+@pytest.fixture
+def gym_slot():
+    """
+    Returns a bookable start time: `days` from today at `hour` on the GYM's clock, in UTC.
+
+    Bookings are refused outside opening hours, so "now + 1 day" is not a safe start
+    any more - run the suite at 23:30 and it lands at 23:30 tomorrow, which closes
+    at 23:00. A fixed local hour makes every booking test pass at any time of day.
+    """
+    def _slot(days: int = 1, hour: int = 10) -> datetime:
+        tz = gym_timezone()
+        local_day = datetime.now(tz).date() + timedelta(days=days)
+        return datetime.combine(local_day, time(hour, 0), tzinfo=tz).astimezone(timezone.utc)
+
+    return _slot
 
 
 @pytest.fixture

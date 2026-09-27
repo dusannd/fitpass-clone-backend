@@ -7,8 +7,10 @@ from typing import List
 from datetime import datetime, timedelta, timezone
 
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.api.dependencies import RequireRole
+from app.api.helpers import to_gym_time
 from app.models.coaching import TrainerClientLink, Appointment
 from app.models.subscription import SubscriptionPlan, UserSubscription
 from app.models.user import User, Role
@@ -80,6 +82,37 @@ def as_utc(value: datetime) -> datetime:
         on SQLite.
     """
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def check_opening_hours(start_time: datetime, end_time: datetime) -> None:
+    """
+    Raise 400 unless the whole session sits inside opening hours on ONE gym day.
+
+    Read on the gym's wall clock, not in UTC: 06:00 in Belgrade is 04:00 or 05:00
+    UTC depending on the season, and a member thinks in local time.
+    """
+    local_start = to_gym_time(start_time)
+    local_end = to_gym_time(end_time)
+
+    opens = local_start.replace(hour=settings.GYM_OPEN_HOUR, minute=0, second=0, microsecond=0)
+    closes = local_start.replace(hour=settings.GYM_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+
+    if local_start < opens or local_end > closes or local_end.date() != local_start.date():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Sessions can only be booked between {settings.GYM_OPEN_HOUR:02d}:00 "
+                f"and {settings.GYM_CLOSE_HOUR:02d}:00."
+            ),
+        )
+
+
+def load_appointment_stmt():
+    """An Appointment select with both people eager-loaded for AppointmentResponse."""
+    return select(Appointment).options(
+        selectinload(Appointment.trainer).selectinload(User.profile),
+        selectinload(Appointment.client).selectinload(User.profile),
+    )
 
 
 @router.post("/request/{trainer_id}")
@@ -289,6 +322,9 @@ async def schedule_appointment(
     if duration.total_seconds() > (3 * 3600):
         raise HTTPException(status_code=400, detail="A single session cannot exceed 3 hours.")
 
+    # 4b. Only inside opening hours - nothing stopped a 03:00 booking before.
+    check_opening_hours(start_time, end_time)
+
     # 5. Security Check: Ensure the client is officially assigned to this trainer
     stmt_link = select(TrainerClientLink).where(
         TrainerClientLink.client_id == client_id,
@@ -313,7 +349,15 @@ async def schedule_appointment(
     # they simply cannot book another until the plan covers it again.
     await require_trainer_entitlement(db, client_id)
 
-    # 6. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
+    # 6a. LOCK THE TRAINER for the rest of this transaction.
+    # The overlap check below and the insert after it are two statements. Without a
+    # lock, two members booking the same slot in the same instant both see "free"
+    # and both get it. Locking the trainer's user row makes bookings for ONE trainer
+    # queue up behind each other, while other trainers are not held up at all.
+    # (SQLite ignores FOR UPDATE, which is fine - it only allows one writer anyway.)
+    await db.execute(select(User.id).where(User.id == payload.trainer_id).with_for_update())
+
+    # 6b. OVERBOOKING PROTECTION: Prevent overlapping sessions for the same trainer
     # Overlap logic: (NewStart < ExistingEnd) AND (NewEnd > ExistingStart)
     stmt_overlap = select(Appointment).where(
         Appointment.trainer_id == payload.trainer_id,
@@ -330,6 +374,20 @@ async def schedule_appointment(
             detail="The trainer already has another session booked at this time."
         )
 
+    # 6c. ...and for the member. Only the trainer's calendar used to be checked, so a
+    # member could book the same hour with two different trainers.
+    stmt_own_overlap = select(Appointment.id).where(
+        Appointment.client_id == client_id,
+        Appointment.status == "SCHEDULED",
+        start_time < Appointment.end_time,
+        end_time > Appointment.start_time,
+    )
+    if (await db.execute(stmt_own_overlap)).first():
+        raise HTTPException(
+            status_code=409,
+            detail="You already have another session booked at this time."
+        )
+
     # 7. Create the appointment (storing the normalised, timezone-aware values)
     new_appointment = Appointment(
         trainer_id=payload.trainer_id,
@@ -342,15 +400,7 @@ async def schedule_appointment(
     await db.commit()
 
     # 8. Reload with relationships eager-loaded for the Pydantic response
-    stmt_reload = (
-        select(Appointment)
-        .options(
-            selectinload(Appointment.trainer).selectinload(User.profile),
-            selectinload(Appointment.client).selectinload(User.profile)
-        )
-        .where(Appointment.id == new_appointment.id)
-    )
-    res_reload = await db.execute(stmt_reload)
+    res_reload = await db.execute(load_appointment_stmt().where(Appointment.id == new_appointment.id))
     return res_reload.scalars().first()
 
 
@@ -408,6 +458,16 @@ async def update_appointment_status(
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found.")
 
+    # COMPLETED and CANCELLED are final. Nothing checked the current status before,
+    # so a finished session could be flipped to CANCELLED (or a cancelled one to
+    # COMPLETED) and the member's history silently rewritten. Repeating the SAME
+    # status is still allowed - that is how a trainer edits feedback afterwards.
+    if appointment.status != "SCHEDULED" and payload.status != appointment.status:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This session is already {appointment.status.lower()}."
+        )
+
     # A session can only be closed out once it has actually begun. We gate on
     # start_time rather than end_time so a trainer who wraps up early doesn't have
     # to sit and wait for the clock.
@@ -429,6 +489,56 @@ async def update_appointment_status(
     if "notes" in update_data:
         appointment.notes = update_data["notes"]
 
+    db.add(appointment)
+    await db.commit()
+
+    return appointment
+
+
+@router.post("/appointments/{appointment_id}/cancel", response_model=AppointmentResponse)
+async def cancel_my_appointment(
+    appointment_id: int,
+    db: AsyncSession = Depends(get_db),
+    client_id: int = Depends(get_current_member)
+):
+    """
+    Member Route: Cancel one of my own upcoming sessions.
+
+    Allowed until MEMBER_CANCEL_CUTOFF_HOURS before the start. After that only the
+    trainer can cancel, so they are never left with an empty slot at the last minute
+    without having agreed to it.
+    """
+    # 1. Only your own appointment. Someone else's is a 404, not a 403, so ids
+    #    cannot be probed for existence.
+    result = await db.execute(
+        load_appointment_stmt().where(
+            Appointment.id == appointment_id,
+            Appointment.client_id == client_id,
+        )
+    )
+    appointment = result.scalars().first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found.")
+
+    # 2. Only a session that is still on.
+    if appointment.status != "SCHEDULED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This session is already {appointment.status.lower()}."
+        )
+
+    # 3. Not inside the cutoff window.
+    cutoff = timedelta(hours=settings.MEMBER_CANCEL_CUTOFF_HOURS)
+    if as_utc(appointment.start_time) - datetime.now(timezone.utc) < cutoff:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Less than {settings.MEMBER_CANCEL_CUTOFF_HOURS} hours to go - "
+                "ask your trainer to cancel this session."
+            ),
+        )
+
+    appointment.status = "CANCELLED"
     db.add(appointment)
     await db.commit()
 

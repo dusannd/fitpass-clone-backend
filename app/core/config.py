@@ -49,6 +49,17 @@ class Settings(BaseSettings):
     # happened the previous evening.
     GYM_TIMEZONE: str = "Europe/Belgrade"
 
+    # Personal training can only be booked inside opening hours, read on the gym's
+    # wall clock (GYM_TIMEZONE). A session may start at GYM_OPEN_HOUR and must be
+    # over by GYM_CLOSE_HOUR.
+    GYM_OPEN_HOUR: int = 6
+    GYM_CLOSE_HOUR: int = 23
+
+    # A member may cancel their own session up to this many hours before it starts.
+    # Inside the window only the trainer can, so a trainer isn't left with an empty
+    # slot at the last minute.
+    MEMBER_CANCEL_CUTOFF_HOURS: int = 12
+
     TESTING: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
