@@ -55,17 +55,16 @@ class RequireRole:
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             user_id = payload.get("sub")
-            token_roles = payload.get("roles", [])
 
             if user_id is None:
                 raise HTTPException(status_code=401, detail="Invalid token structure")
 
-            if self.required_role not in token_roles:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
-                )
-
+            # The roles are read from the DATABASE only, never from the token. The
+            # token's "roles" claim is frozen at login, so gating on it meant a role an
+            # admin had just granted answered 403 until the person logged out and in
+            # again. The database is asked on every request anyway (it is what makes a
+            # revoked role stop working at once), so it is the one source of truth.
+            #
             # Use the INJECTED session instead of opening our own.
             # Calling AsyncSessionLocal() by hand ignores the get_db override,
             # so during tests every role protected route would still talk to
@@ -83,7 +82,7 @@ class RequireRole:
             if self.required_role not in actual_roles:
                 raise HTTPException(
                     status_code=403,
-                    detail="Your privileges have been revoked by an administrator."
+                    detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
                 )
 
             return int(user_id)
