@@ -58,15 +58,31 @@ def check_entry_policy(
     current_time = local_now.time()
     current_weekday = local_now.weekday()  # 0=Monday ... 6=Sunday, matches allowed_days
 
-    if rule.allowed_days:
-        allowed_days_list = [int(d) for d in rule.allowed_days.split(",") if d.strip() != ""]
-        if current_weekday not in allowed_days_list:
-            return "day"
-
+    # --- 3. TIME WINDOW ---
     # Both boundaries have to be set for the window to mean anything, and the
     # comparison stays inclusive on both ends, exactly as the turnstile had it.
+    # A start later than the end is an overnight window (22:00-06:00). A plain
+    # `start <= t <= end` can never hold for one, so it locked every member of
+    # such a plan out around the clock. It is open from the start until midnight
+    # OR from midnight until the end.
+    window_day = current_weekday
     if rule.allowed_time_start and rule.allowed_time_end:
-        if not (rule.allowed_time_start <= current_time <= rule.allowed_time_end):
-            return "time"
+        start, end = rule.allowed_time_start, rule.allowed_time_end
+        if start <= end:
+            if not (start <= current_time <= end):
+                return "time"
+        else:
+            if not (current_time >= start or current_time <= end):
+                return "time"
+            # The small hours belong to the night the window opened on: at 03:00
+            # on Tuesday, a "Monday 22:00-06:00" pass is still on its Monday.
+            if current_time <= end:
+                window_day = (current_weekday - 1) % 7
+
+    # --- 4. DAY RULE ---
+    if rule.allowed_days:
+        allowed_days_list = [int(d) for d in rule.allowed_days.split(",") if d.strip() != ""]
+        if window_day not in allowed_days_list:
+            return "day"
 
     return None

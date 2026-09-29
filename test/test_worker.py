@@ -441,8 +441,8 @@ def _window_around(local_now: datetime) -> tuple[time, time]:
     fails the test rather than quietly passing it.
 
     The ends are clamped into the same day so the window can never wrap past
-    midnight - `start <= t <= end` is unsatisfiable when start > end, which would
-    deny for a reason the test is not trying to prove.
+    midnight - a start later than the end reads as an overnight window, which
+    would test something this test is not trying to prove.
     """
     seconds = local_now.hour * 3600 + local_now.minute * 60 + local_now.second
     start = max(0, seconds - 1800)
