@@ -14,10 +14,16 @@ def get_password_hash(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
+# The "type" claim every login cookie carries. QR, verify-email and reset tokens are
+# signed with the same key and carry the same "sub", so this claim is the only thing
+# that tells a session apart from them. dependencies.decode_session_token checks it.
+SESSION_TOKEN_TYPE = "session"
+
+
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "type": SESSION_TOKEN_TYPE})
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 

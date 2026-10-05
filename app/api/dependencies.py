@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import SESSION_TOKEN_TYPE
 from app.models.user import User
 
 
@@ -20,18 +21,36 @@ def get_token_from_cookie(request: Request) -> str:
     return token
 
 
+def decode_session_token(token: str) -> int:
+    """
+    Decodes a login cookie and returns the user ID.
+
+    A member's QR code is a JWT signed with the same key and carrying the same "sub",
+    and it is shown on a screen for anyone to photograph. Without the "type" check that
+    QR token, pasted into the access_token cookie, was a full session for 5 minutes.
+    Every cookie consumer (the dependencies below and the /access/ws socket) goes
+    through here so none of them can skip it.
+
+    Raises jwt.ExpiredSignatureError / jwt.InvalidTokenError for the caller to map.
+    """
+    payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+    if payload.get("type") != SESSION_TOKEN_TYPE:
+        raise jwt.InvalidTokenError("Not a session token")
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise jwt.InvalidTokenError("Invalid token structure")
+
+    return int(user_id)
+
+
 def get_current_user_id(token: str = Depends(get_token_from_cookie)) -> int:
     """
     Extracts the token from the httpOnly cookie, decodes it, and returns the user ID.
     """
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = payload.get("sub")
-
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token structure")
-
-        return int(user_id)
+        return decode_session_token(token)
 
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired. Please log in again.")
@@ -53,11 +72,7 @@ class RequireRole:
             db: AsyncSession = Depends(get_db)
     ) -> int:
         try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-            user_id = payload.get("sub")
-
-            if user_id is None:
-                raise HTTPException(status_code=401, detail="Invalid token structure")
+            user_id = decode_session_token(token)
 
             # The roles are read from the DATABASE only, never from the token. The
             # token's "roles" claim is frozen at login, so gating on it meant a role an
@@ -70,7 +85,7 @@ class RequireRole:
             # so during tests every role protected route would still talk to
             # the real database instead of the test one.
             result = await db.execute(
-                select(User).options(selectinload(User.roles)).where(User.id == int(user_id))
+                select(User).options(selectinload(User.roles)).where(User.id == user_id)
             )
             user = result.scalars().first()
 
@@ -85,7 +100,7 @@ class RequireRole:
                     detail=f"Forbidden: You don't have the '{self.required_role}' privilege"
                 )
 
-            return int(user_id)
+            return user_id
 
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expired.")

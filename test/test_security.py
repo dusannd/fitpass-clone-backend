@@ -166,3 +166,45 @@ async def test_honeypot_blocks_bot_login():
     data = response.json()
     assert data["code"] == "HONEYPOT_TRIGGERED"
     assert data["message"] == "Invalid request."
+
+# ==========================================
+# SESSION COOKIE: ONLY A LOGIN TOKEN OPENS A SESSION
+# ==========================================
+
+@pytest.mark.asyncio
+async def test_qr_token_is_not_a_session_cookie():
+    """
+    A member's QR code is a JWT signed with the same key and carrying the same "sub"
+    as their login cookie, and it is shown on a screen for anyone to photograph.
+    Pasted into the access_token cookie it must be refused, not treated as a login.
+    """
+    from app.core.security import create_qr_token
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # @test.com is auto-verified while settings.TESTING is on, so it can log in
+        email = f"qr_session_{uuid.uuid4().hex[:8]}@test.com"
+        password = "correcthorsebattery"
+        reg = await ac.post("/api/users/", json={
+            "email": email, "password": password, "first_name": "Qr", "last_name": "Session",
+        })
+        assert reg.status_code in (200, 201), reg.text
+        login = await ac.post("/api/users/login", json={"email": email, "password": password})
+        assert login.status_code == 200, login.text
+        session = login.cookies["access_token"]
+
+        # The real login cookie works...
+        me = await ac.get("/api/users/me", headers={"Cookie": f"access_token={session}"})
+        assert me.status_code == 200, me.text
+        user_id = me.json()["id"]
+
+        # ...a QR token for the very same user does not
+        qr_token = create_qr_token(user_id, "ENTRY")
+        ac.cookies.clear()
+        res = await ac.get("/api/users/me", headers={"Cookie": f"access_token={qr_token}"})
+        assert res.status_code == 401
+
+        # Nor does it pass a role gate
+        res = await ac.post("/api/access/generate", json={"action_type": "ENTRY"},
+                            headers={"Cookie": f"access_token={qr_token}"})
+        assert res.status_code == 401

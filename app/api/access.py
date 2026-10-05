@@ -15,7 +15,7 @@ from app.core.websockets import ws_manager
 from app.models.access import EntryLog
 from app.models.subscription import UserSubscription, SubscriptionPlan, SubscriptionRule, plan_locations
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse, GenerateQRRequest
-from app.api.dependencies import RequireRole
+from app.api.dependencies import RequireRole, decode_session_token
 from app.api.entry_policy import check_entry_policy
 
 router = APIRouter()
@@ -135,8 +135,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1008, reason="Missing authentication cookie")
             return
 
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = int(payload.get("sub"))
+        user_id = decode_session_token(token)
 
         ws_manager.connect(websocket, user_id)
 
