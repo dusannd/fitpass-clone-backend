@@ -9,7 +9,7 @@ from app.core.database import get_db
 from app.core.redis_client import redis_db
 from app.core.websockets import ws_manager
 from app.models.user import User, Role
-from app.models.access import EntryLog
+from app.models.access import EntryLog, MANUAL_OVERRIDE_REASON, FORCE_CHECKOUT_REASON
 from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.api.dependencies import RequireRole
 from app.api.entry_policy import check_entry_policy
@@ -104,7 +104,7 @@ async def manual_entry_override(
         location_id=location_id,  # <--- NEW: Store the location in the log
         access_granted=True,
         action_type="ENTRY",  # Spelled out rather than leaning on the column default
-        reason="Manual Override by Desk Worker"
+        reason=MANUAL_OVERRIDE_REASON
     )
 
     db.add(entry_log)
@@ -447,6 +447,13 @@ async def force_checkout(
     Worker Dashboard: Forcefully checks out a user if they forgot to scan the exit QR.
     Frees up their Redis status so they can enter again next time.
     """
+    # 0. Same 404 contract as every other target_user_id endpoint here. Without it
+    # an unknown id set a Redis key for nobody and then died on the entry_logs
+    # foreign key with a bare 500.
+    result = await db.execute(select(User).where(User.id == target_user_id))
+    if not result.scalars().first():
+        raise HTTPException(status_code=404, detail="User not found")
+
     # 1. Reset Redis state to OUTSIDE
     redis_key = f"user_status:{target_user_id}"
     await redis_db.set(redis_key, "OUTSIDE")
@@ -457,7 +464,7 @@ async def force_checkout(
         worker_id=worker_id,
         access_granted=True,
         action_type="EXIT",
-        reason="Force Checkout by Worker"
+        reason=FORCE_CHECKOUT_REASON
     )
     db.add(entry_log)
     await db.commit()

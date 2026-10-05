@@ -4,6 +4,15 @@ from sqlalchemy.sql import func
 from app.core.database import Base
 
 
+# The reasons a desk worker's own actions are logged under. The admin audit screen
+# finds override rows by these, not by worker_id: that column is ON DELETE SET NULL,
+# so filtering on it made a deleted worker's whole override history vanish from the
+# very screen that justified deleting them.
+MANUAL_OVERRIDE_REASON = "Manual Override by Desk Worker"
+FORCE_CHECKOUT_REASON = "Force Checkout by Worker"
+WORKER_ACTION_REASONS = (MANUAL_OVERRIDE_REASON, FORCE_CHECKOUT_REASON)
+
+
 class EntryLog(Base):
     """
     Logs every attempt to enter or exit the gym.

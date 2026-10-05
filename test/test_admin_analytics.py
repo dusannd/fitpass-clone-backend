@@ -6,6 +6,7 @@ from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.api.dependencies import get_current_admin
 from app.api.helpers import to_gym_time
+from app.models.access import MANUAL_OVERRIDE_REASON
 
 
 # Same override trick test_hr.py uses: force the admin dependency to pass without
@@ -43,9 +44,10 @@ async def test_manual_override_audit_returns_rows(seed_entry_logs):
         member_id, member_email = await _register(ac, "Audit", "Member")
         worker_id, _ = await _register(ac, "Desk", "Worker")
 
-        # A manual override is a log that carries a worker_id
+        # A manual override is a log written under the override reason
         await seed_entry_logs([
-            {"user_id": member_id, "worker_id": worker_id, "access_granted": True, "action_type": "ENTRY"},
+            {"user_id": member_id, "worker_id": worker_id, "access_granted": True,
+             "action_type": "ENTRY", "reason": MANUAL_OVERRIDE_REASON},
         ])
 
         try:
@@ -68,6 +70,44 @@ async def test_manual_override_audit_returns_rows(seed_entry_logs):
             assert row["access_granted"] is True
             assert row["action_type"] == "ENTRY"
 
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_override_audit_survives_deleting_the_worker(seed_entry_logs):
+    """
+    entry_logs.worker_id is ON DELETE SET NULL, so deleting a worker's account blanks
+    it on every row they wrote. The audit used to find overrides by
+    "worker_id IS NOT NULL", so the deleted worker's overrides vanished from the
+    one screen built to catch override abuse. The row below is exactly what an
+    override looks like after its worker is gone. A turnstile scan also carries
+    the scanning worker's id and must NOT be listed as an override.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        member_id, member_email = await _register(ac, "Orphan", "Override")
+        worker_id, _ = await _register(ac, "Scan", "Worker")
+
+        await seed_entry_logs([
+            # The override, after the worker who opened the door was deleted
+            {"user_id": member_id, "worker_id": None, "access_granted": True,
+             "action_type": "ENTRY", "reason": MANUAL_OVERRIDE_REASON},
+            # An ordinary QR scan at a worker's scanner
+            {"user_id": member_id, "worker_id": worker_id, "access_granted": True,
+             "action_type": "ENTRY", "reason": "Access Granted."},
+        ])
+
+        try:
+            app.dependency_overrides[get_current_admin] = override_get_current_admin
+
+            res = await ac.get("/api/admin/audit/manual-overrides", params={"limit": 50})
+            assert res.status_code == 200, res.text
+
+            mine = [r for r in res.json()["items"] if r["user"] and r["user"]["email"] == member_email]
+            assert len(mine) == 1, "Expected exactly the override, not the scan"
+            assert mine[0]["worker"] is None
         finally:
             app.dependency_overrides.pop(get_current_admin, None)
 

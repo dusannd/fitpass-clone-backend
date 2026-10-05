@@ -737,3 +737,24 @@ async def test_revoking_is_closed_to_everyone_else(seed_subscription):
             assert sub_id is not None
         finally:
             app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_force_checkout_unknown_user_is_404():
+    """
+    Every other target_user_id endpoint on the desk answers 404 for a user that
+    does not exist. force_checkout used to skip the lookup, set a Redis key for
+    nobody and then hit the entry_logs foreign key - a bare 500 on Postgres.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+
+            res = await ac.post("/api/worker/force-checkout/987654321")
+            assert res.status_code == 404
+            assert res.json()["detail"] == "User not found"
+
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)

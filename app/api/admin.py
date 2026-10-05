@@ -8,7 +8,7 @@ from typing import List
 from app.core.database import get_db
 from app.api.dependencies import get_current_admin
 from app.api.helpers import build_like_pattern, full_name, to_gym_time, gym_day_bounds_utc, gym_timezone
-from app.models.access import EntryLog
+from app.models.access import EntryLog, WORKER_ACTION_REASONS
 from app.models.user import User, Role
 from app.models.subscription import UserSubscription, SubscriptionPlan
 from app.schemas.access import AdminEntryLogResponse, PaginatedEntryLogs
@@ -282,10 +282,11 @@ async def audit_worker_overrides(
     # Count every override before slicing, so the page counter reflects the whole
     # audit trail rather than the page in front of the admin
     total = await db.scalar(
-        select(func.count(EntryLog.id)).where(EntryLog.worker_id.isnot(None))
+        select(func.count(EntryLog.id)).where(EntryLog.reason.in_(WORKER_ACTION_REASONS))
     )
 
-    # Fetch logs where worker_id is NOT NULL
+    # Match on the reason, not on worker_id: deleting a worker's account nulls
+    # worker_id on every row they wrote, which would hide their overrides here
     stmt = (
         select(EntryLog)
         .options(
@@ -293,7 +294,7 @@ async def audit_worker_overrides(
             selectinload(EntryLog.worker),  # Which worker let them in?
             selectinload(EntryLog.location)  # At which gym?
         )
-        .where(EntryLog.worker_id.isnot(None))  # <--- SMART FILTER
+        .where(EntryLog.reason.in_(WORKER_ACTION_REASONS))
         # id breaks timestamp ties, so a row cannot show up on two pages
         .order_by(EntryLog.timestamp.desc(), EntryLog.id.desc())
         .offset(skip)
