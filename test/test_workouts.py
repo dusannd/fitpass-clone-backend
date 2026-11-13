@@ -1,6 +1,8 @@
 import pytest
 import uuid
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
 from app.api.dependencies import get_current_admin
@@ -222,3 +224,66 @@ async def test_member_can_remove_plans_from_their_library(seed_subscription):
         # And the owner's view is unaffected by that attempt
         res_private = await ac.get("/api/workouts/my-private-plans", headers=client_headers)
         assert len(res_private.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_double_tap_on_follow_and_dismiss_is_not_a_500(seed_subscription, monkeypatch):
+    """
+    REGRESSION TEST: follow and dismiss check first and insert second, against a
+    composite primary key. Two taps landing together both pass the check and the
+    second commit raises IntegrityError, which used to surface as a raw 500.
+
+    The race cannot be timed reliably, so the losing commit is simulated: the check
+    runs normally and the commit raises exactly what Postgres would.
+    """
+    transport = ASGITransport(app=app)
+    password = "testpassword123"
+    trainer_email = f"trainer_{uuid.uuid4().hex[:6]}@test.com"
+    client_email = f"client_{uuid.uuid4().hex[:6]}@test.com"
+
+    async def losing_commit(self):
+        raise IntegrityError("INSERT", {}, Exception("duplicate key value violates unique constraint"))
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.post("/api/users/", json={
+            "email": trainer_email, "password": password, "first_name": "T", "last_name": "T"})
+        trainer_id = res.json()["id"]
+        try:
+            app.dependency_overrides[get_current_admin] = override_get_current_admin
+            await ac.post("/api/admin/hr/hire", json={"email": trainer_email, "role_name": "trainer"})
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)
+        res = await ac.post("/api/users/login", json={"email": trainer_email, "password": password})
+        trainer_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+        res = await ac.post("/api/users/", json={
+            "email": client_email, "password": password, "first_name": "C", "last_name": "C"})
+        client_id = res.json()["id"]
+        res = await ac.post("/api/users/login", json={"email": client_email, "password": password})
+        client_headers = {"Cookie": f"access_token={res.cookies['access_token']}"}
+
+        await seed_subscription(client_id, includes_trainer=True)
+        await ac.post(f"/api/coaching/request/{trainer_id}", headers=client_headers)
+        res = await ac.get("/api/coaching/requests", headers=trainer_headers)
+        await ac.put(f"/api/coaching/requests/{res.json()[0]['id']}", json={"status": "ACCEPTED"},
+                     headers=trainer_headers)
+
+        public_id = (await ac.post("/api/trainer/plans", json={
+            "name": "Race Public", "exercises": [{"name": "Row", "sets": 3, "reps": "8"}]},
+            headers=trainer_headers)).json()["id"]
+        private_id = (await ac.post("/api/trainer/plans", json={
+            "name": "Race Private", "client_id": client_id,
+            "exercises": [{"name": "Dip", "sets": 3, "reps": "8"}]},
+            headers=trainer_headers)).json()["id"]
+
+        # Follow: the losing request still answers success
+        with monkeypatch.context() as patched:
+            patched.setattr(AsyncSession, "commit", losing_commit)
+            res = await ac.post(f"/api/workouts/{public_id}/follow", headers=client_headers)
+        assert res.status_code == 200, res.text
+
+        # Dismiss: same
+        with monkeypatch.context() as patched:
+            patched.setattr(AsyncSession, "commit", losing_commit)
+            res = await ac.post(f"/api/workouts/{private_id}/dismiss", headers=client_headers)
+        assert res.status_code == 200, res.text

@@ -136,3 +136,70 @@ async def test_staff_list_contains_only_staff():
 
         finally:
             app.dependency_overrides.pop(get_current_admin, None)
+
+
+
+# --- Admin lock-out guards ---
+
+def _admin_as(admin_id: int):
+    async def _override():
+        return admin_id
+    return _override
+
+
+async def _make_admin(ac: AsyncClient, set_user_roles) -> tuple[int, str]:
+    email = f"boss_{uuid.uuid4().hex[:6]}@gym.com"
+    res = await ac.post("/api/users/", json={
+        "email": email, "password": "strongpassword123", "first_name": "Boss", "last_name": "Man",
+    })
+    user_id = res.json()["id"]
+    await set_user_roles(user_id, ["member", "admin"])
+    return user_id, email
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_remove_their_own_admin_role(set_user_roles):
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        me, my_email = await _make_admin(ac, set_user_roles)
+        _other, _ = await _make_admin(ac, set_user_roles)  # so "last admin" cannot be the reason
+
+        try:
+            app.dependency_overrides[get_current_admin] = _admin_as(me)
+            res = await ac.post("/api/admin/hr/fire", json={"email": my_email, "role_name": "admin"})
+            assert res.status_code == 400
+            assert res.json()["detail"] == "You cannot remove your own admin role."
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_last_admin_cannot_be_removed_but_one_of_two_can(set_user_roles):
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        first_id, first_email = await _make_admin(ac, set_user_roles)
+        second_id, second_email = await _make_admin(ac, set_user_roles)
+
+        try:
+            # The caller is a stand-in id, so only the "last admin" rule can fire.
+            app.dependency_overrides[get_current_admin] = _admin_as(987654321)
+
+            # The database is shared across the session: demote every OTHER admin
+            # so exactly the two made here remain.
+            staff = (await ac.get("/api/admin/hr/staff")).json()
+            for row in staff:
+                if row["id"] not in (first_id, second_id) and "admin" in {r["name"] for r in row["roles"]}:
+                    await set_user_roles(row["id"], ["member"])
+
+            # One of two admins can go...
+            res = await ac.post("/api/admin/hr/fire", json={"email": first_email, "role_name": "admin"})
+            assert res.status_code == 200, res.text
+
+            # ...but the one left cannot.
+            res = await ac.post("/api/admin/hr/fire", json={"email": second_email, "role_name": "admin"})
+            assert res.status_code == 400
+            assert res.json()["detail"] == "Cannot remove the last administrator."
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)

@@ -2,8 +2,10 @@ import pytest
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
+from app.core.redis_client import redis_db
 from app.api.helpers import to_gym_time
 from app.api.worker import get_current_worker
 
@@ -758,3 +760,79 @@ async def test_force_checkout_unknown_user_is_404():
 
         finally:
             app.dependency_overrides.pop(get_current_worker, None)
+
+
+
+@pytest.mark.asyncio
+async def test_force_checkout_stores_the_location(seed_subscription, plan_location_ids, read_entry_logs):
+    """
+    force_checkout never recorded where the checkout happened. The location is
+    optional (old clients do not send it), but when sent it is stored, and an
+    unknown one is a 404 rather than a foreign-key 500.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+
+            member_id, _ = await register_member(ac, "Out", "Door")
+            sub_id = await seed_subscription(member_id, location_names=["Checkout Gym"])
+            [location_id] = await plan_location_ids(sub_id)
+
+            # a) With a location: stored on the log
+            res = await ac.post(f"/api/worker/force-checkout/{member_id}?location_id={location_id}")
+            assert res.status_code == 200, res.text
+            logs = await read_entry_logs(member_id)
+            assert logs[-1]["action_type"] == "EXIT"
+            assert logs[-1]["location_id"] == location_id
+
+            # b) Unknown location: 404 and no new log row
+            res = await ac.post(f"/api/worker/force-checkout/{member_id}?location_id=987654321")
+            assert res.status_code == 404
+            assert res.json()["detail"] == "Gym location not found"
+            assert len(await read_entry_logs(member_id)) == 1
+
+            # c) Omitted: still works, location stays empty
+            res = await ac.post(f"/api/worker/force-checkout/{member_id}")
+            assert res.status_code == 200
+            logs = await read_entry_logs(member_id)
+            assert len(logs) == 2 and logs[-1]["location_id"] is None
+
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_force_checkout_leaves_redis_alone_when_the_commit_fails(monkeypatch):
+    """
+    force_checkout used to flip Redis to OUTSIDE BEFORE committing the audit row, so
+    a failed commit left the member "outside" with no log of how. The write now
+    follows the commit.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        member_id = None
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+
+            member_id, _ = await register_member(ac, "Stuck", "Inside")
+            redis_key = f"user_status:{member_id}"
+            await redis_db.set(redis_key, "INSIDE")
+
+            async def failing_commit(self):
+                raise RuntimeError("database went away")
+
+            with monkeypatch.context() as patched:
+                patched.setattr(AsyncSession, "commit", failing_commit)
+                # main.py turns an unhandled error into a 500 instead of re-raising
+                res = await ac.post(f"/api/worker/force-checkout/{member_id}")
+            assert res.status_code == 500
+
+            assert await redis_db.get(redis_key) == "INSIDE"
+
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+            if member_id is not None:
+                await redis_db.delete(f"user_status:{member_id}")

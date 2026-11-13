@@ -1,6 +1,7 @@
 import pytest
 import uuid
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.exc import IntegrityError
 
 from app.main import app
 # The plan routes build their OWN RequireRole("admin") instance, so that is the
@@ -336,3 +337,60 @@ async def test_plans_come_back_cheapest_first(admin_client):
         all_public_prices = [p["price"] for p in res_public.json()]
         assert all_public_prices == sorted(all_public_prices)
 
+
+
+async def _delete_location_setup(ac, seed_subscription, plan_location_ids, location_names, is_active=1):
+    """A member holding a pass on a fresh plan with the given locations."""
+    res = await ac.post("/api/users/", json={
+        "email": f"locdel_{uuid.uuid4().hex[:8]}@test.com", "password": "strongpassword123",
+        "first_name": "Loc", "last_name": "Del",
+    })
+    sub_id = await seed_subscription(res.json()["id"], location_names=location_names, is_active=is_active)
+    return await plan_location_ids(sub_id)
+
+
+@pytest.mark.asyncio
+async def test_cannot_delete_the_only_location_of_a_plan_with_live_subscribers(
+        admin_client, seed_subscription, plan_location_ids):
+    """
+    Deleting a location cascades out of plan_locations, and a plan with no locations
+    denies entry to everybody - paying members included. It is refused instead.
+    """
+    async with admin_client as ac:
+        [only] = await _delete_location_setup(ac, seed_subscription, plan_location_ids, ["Only Gym"])
+
+        res = await ac.delete(f"/api/subscriptions/locations/{only}")
+        assert res.status_code == 400
+        assert "Seeded Plan" in res.json()["detail"]
+
+        # Still there afterwards
+        assert (await ac.delete(f"/api/subscriptions/locations/{only}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_can_delete_a_location_when_nothing_would_be_orphaned(
+        admin_client, seed_subscription, plan_location_ids):
+    """The guard must not over-fire: spare locations and lapsed passes are fine."""
+    async with admin_client as ac:
+        # a) The plan keeps its other location
+        first, _second = await _delete_location_setup(
+            ac, seed_subscription, plan_location_ids, ["Pair A", "Pair B"])
+        assert (await ac.delete(f"/api/subscriptions/locations/{first}")).status_code == 204
+
+        # b) Only location, but nobody holds a live pass on the plan
+        [lapsed] = await _delete_location_setup(
+            ac, seed_subscription, plan_location_ids, ["Lapsed Gym"], is_active=0)
+        assert (await ac.delete(f"/api/subscriptions/locations/{lapsed}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_plan_is_active_cannot_be_null_and_defaults_to_true(insert_bare_plan):
+    """
+    is_active was added nullable with no backfill, so old rows held NULL and every
+    reader had to paper over it. The column is NOT NULL with a server default now:
+    an insert that leaves it out gets True, and an explicit NULL is refused.
+    """
+    assert await insert_bare_plan() is True
+
+    with pytest.raises(IntegrityError):
+        await insert_bare_plan(is_active=None)

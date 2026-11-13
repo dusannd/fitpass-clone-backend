@@ -2,13 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from datetime import datetime, timezone
 from typing import List
 
 
 from app.core.database import get_db
-from app.models.subscription import SubscriptionPlan, UserSubscription, GymLocation, SubscriptionRule
+from app.models.subscription import SubscriptionPlan, UserSubscription, GymLocation, SubscriptionRule, plan_locations
 from app.schemas.subscription import (
     PlanCreate, PlanUpdate, PlanResponse,
     MySubscriptionResponse,
@@ -108,6 +108,40 @@ async def delete_location(
 
     if not location_to_delete:
         raise HTTPException(status_code=404, detail="Gym location not found")
+
+    # Deleting the location cascades out of plan_locations, and a plan left with no
+    # locations denies entry to everybody (entry_policy.py), including members who
+    # paid for it. Refuse while a plan depends on this as its ONLY location and
+    # still has a live subscription; the admin must give it another location first.
+    now = datetime.now(timezone.utc)
+    only_location_plans = (
+        select(plan_locations.c.plan_id)
+        .group_by(plan_locations.c.plan_id)
+        .having(func.count(plan_locations.c.location_id) == 1)
+    )
+    orphan_result = await db.execute(
+        select(SubscriptionPlan.name)
+        .join(plan_locations, plan_locations.c.plan_id == SubscriptionPlan.id)
+        .where(
+            plan_locations.c.location_id == location_id,
+            SubscriptionPlan.id.in_(only_location_plans),
+            SubscriptionPlan.id.in_(
+                select(UserSubscription.plan_id).where(
+                    UserSubscription.is_active == 1,
+                    UserSubscription.end_date > now,
+                )
+            ),
+        )
+        .order_by(SubscriptionPlan.name)
+    )
+    orphaned_plans = orphan_result.scalars().all()
+    if orphaned_plans:
+        names = ", ".join(f"'{name}'" for name in orphaned_plans)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete this location: it is the only location of {names}, "
+                   "which still has active subscribers. Add another location to the plan first.",
+        )
 
     await db.delete(location_to_delete)
     await db.commit()

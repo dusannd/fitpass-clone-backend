@@ -440,6 +440,7 @@ async def get_recent_logs(
 @router.post("/force-checkout/{target_user_id}")
 async def force_checkout(
         target_user_id: int,
+        location_id: int | None = None,
         db: AsyncSession = Depends(get_db),
         worker_id: int = Depends(get_current_worker)
 ):
@@ -454,20 +455,31 @@ async def force_checkout(
     if not result.scalars().first():
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 1. Reset Redis state to OUTSIDE
-    redis_key = f"user_status:{target_user_id}"
-    await redis_db.set(redis_key, "OUTSIDE")
+    # 1. Optional location. Optional so older clients that never send it keep
+    # working; when it is sent it must exist, or the log insert would die on the
+    # foreign key with a bare 500.
+    if location_id is not None:
+        from app.models.subscription import GymLocation
+        loc_result = await db.execute(select(GymLocation).where(GymLocation.id == location_id))
+        if not loc_result.scalars().first():
+            raise HTTPException(status_code=404, detail="Gym location not found")
 
     # 2. Write a manual EXIT log to the database
     entry_log = EntryLog(
         user_id=target_user_id,
         worker_id=worker_id,
+        location_id=location_id,
         access_granted=True,
         action_type="EXIT",
         reason=FORCE_CHECKOUT_REASON
     )
     db.add(entry_log)
     await db.commit()
+
+    # 3. Reset Redis state to OUTSIDE only after the audit row is safely stored.
+    # Writing it first meant a failed commit left Redis saying OUTSIDE with no log.
+    # If Redis fails after the commit, the key is simply rebuilt from the database.
+    await redis_db.set(f"user_status:{target_user_id}", "OUTSIDE")
 
     # Notify the member's dashboard in real-time so it resyncs instantly
     await ws_manager.send_personal_message(

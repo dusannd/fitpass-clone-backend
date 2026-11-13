@@ -41,7 +41,13 @@ async def test_a_refused_code_can_be_scanned_again(seed_subscription):
         await seed_subscription(member_id, location_names=[f"Scan Test {tag}"])
         res = await ac.get("/api/subscriptions/locations", headers=member_headers)
         allowed = next(loc["id"] for loc in res.json() if f"Scan Test {tag}" in loc["name"])
-        elsewhere = max(loc["id"] for loc in res.json()) + 1000
+
+        # A REAL gym the pass does not cover. An id that does not exist at all is a
+        # 404 now (see test_scan_at_unknown_location...), so "wrong gym" needs a gym.
+        # Attached to an inactive pass so it cannot change which plan the door reads.
+        await seed_subscription(member_id, location_names=[f"Scan Other {tag}"], is_active=0)
+        res = await ac.get("/api/subscriptions/locations", headers=member_headers)
+        elsewhere = next(loc["id"] for loc in res.json() if f"Scan Other {tag}" in loc["name"])
 
         token = create_qr_token(user_id=member_id, action_type="ENTRY")
 
@@ -70,3 +76,44 @@ async def test_a_refused_code_can_be_scanned_again(seed_subscription):
             assert "already used" in res.json()["detail"]
         finally:
             app.dependency_overrides.pop(get_current_worker, None)
+
+
+@pytest.mark.asyncio
+async def test_scan_at_unknown_location_is_404_and_does_not_burn_the_code(
+        seed_subscription, plan_location_ids, read_entry_logs):
+    """
+    A scan carrying a location that does not exist (deleted gym, stale kiosk URL)
+    used to proceed and die on the entry_logs foreign key with a 500. It is a 404
+    now, raised before the jti is burned and before any log row, so the same code
+    still opens the door at a real gym.
+    """
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        email = f"door_{uuid.uuid4().hex[:6]}@test.com"
+        res = await ac.post("/api/users/", json={
+            "email": email, "password": "password123", "first_name": "D", "last_name": "D",
+        })
+        member_id = res.json()["id"]
+        await redis_db.delete(f"user_status:{member_id}")
+
+        sub_id = await seed_subscription(member_id, location_names=["Scan Real"])
+        [real_location] = await plan_location_ids(sub_id)
+        token = create_qr_token(user_id=member_id, action_type="ENTRY")
+
+        try:
+            app.dependency_overrides[get_current_worker] = override_get_current_worker
+
+            res = await ac.post("/api/access/scan", json={
+                "qr_token": token, "location_id": 987654321, "scan_type": "ENTRY",
+            })
+            assert res.status_code == 404
+            assert res.json()["detail"] == "Gym location not found"
+            assert await read_entry_logs(member_id) == [], "A 404 must not write a log row"
+
+            # The code was never used, so it still works at a real gym
+            res = await ac.post("/api/access/scan", json={
+                "qr_token": token, "location_id": real_location, "scan_type": "ENTRY",
+            })
+            assert res.status_code == 200, res.text
+        finally:
+            app.dependency_overrides.pop(get_current_worker, None)
+            await redis_db.delete(f"user_status:{member_id}")

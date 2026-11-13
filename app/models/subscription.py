@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Time, Table, Boolean, false
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Time, Table, Boolean, false, true
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -37,7 +37,7 @@ class SubscriptionPlan(Base):
     duration_days = Column(Integer, default=30)
 
     # NEW: Used for Soft Deletion (hiding old plans from the frontend)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True, server_default=true(), nullable=False)
 
     # Drives the pricing-card styling on the member side ("Standard", "Pro", "VIP").
     # Kept as a plain String (not an Enum) to match is_active/allowed_days, and so

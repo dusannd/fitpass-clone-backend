@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import delete, insert, func
 from typing import List
 
@@ -95,11 +96,19 @@ async def follow_workout_plan(
         raise HTTPException(status_code=400, detail="You are already following this plan.")
 
     # 4. Add the plan to user's saved plans
+    # Read the name now: a rollback expires every loaded object, and touching
+    # plan.name afterwards would try to lazy-load under asyncio.
+    plan_name = plan.name
     user.saved_plans.append(plan)
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # A double tap slipped past the check above and the composite primary key
+        # caught it. The plan is followed either way, so treat it as already done.
+        await db.rollback()
 
-    return {"status": "success", "message": f"You are now following '{plan.name}'"}
+    return {"status": "success", "message": f"You are now following '{plan_name}'"}
 
 
 @router.delete("/{plan_id}/follow")
@@ -175,8 +184,13 @@ async def dismiss_assigned_plan(
     )
 
     if not already_hidden.first():
-        await db.execute(insert(user_dismissed_plans).values(user_id=member_id, plan_id=plan_id))
-        await db.commit()
+        try:
+            await db.execute(insert(user_dismissed_plans).values(user_id=member_id, plan_id=plan_id))
+            await db.commit()
+        except IntegrityError:
+            # Two taps raced past the check above; the primary key stopped the
+            # second one. The plan is hidden either way.
+            await db.rollback()
 
     return {"status": "success", "message": "Plan hidden from your workout center"}
 

@@ -41,7 +41,9 @@ async def get_todays_analytics(
         select(func.count(EntryLog.id)).where(
             EntryLog.timestamp >= day_start,
             EntryLog.timestamp < day_end,
-            EntryLog.access_granted == True
+            EntryLog.access_granted == True,
+            # EXIT scans are granted too; without this every visit counted twice.
+            EntryLog.action_type == "ENTRY"
         )
     )
     total_entries_today = result_entries.scalar()
@@ -99,7 +101,10 @@ async def get_finances(
 
     stmt = (
         select(
-            func.count(UserSubscription.id),
+            # Distinct members, not rows: a member holding two active rows is one
+            # member, and counting rows pushed the "no subscription" slice negative.
+            # MRR below still sums per row because each row is real revenue.
+            func.count(func.distinct(UserSubscription.user_id)),
             func.sum(SubscriptionPlan.price / safe_duration * 30),
         )
         .join(SubscriptionPlan, UserSubscription.plan_id == SubscriptionPlan.id)
@@ -419,7 +424,18 @@ async def fire_staff(
     if not role_to_remove:
         raise HTTPException(status_code=400, detail=f"User {user.email} does not have the '{request.role_name}' role.")
 
-    # 4. Remove the role and save
+    # 4. Never let the admin role disappear: removing your own, or the last one,
+    # locks everybody out of /admin with no endpoint to get back in.
+    if request.role_name == "admin":
+        if user.id == admin_id:
+            raise HTTPException(status_code=400, detail="You cannot remove your own admin role.")
+        admin_count = await db.scalar(
+            select(func.count(User.id)).join(User.roles).where(Role.name == "admin")
+        )
+        if (admin_count or 0) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot remove the last administrator.")
+
+    # 5. Remove the role and save
     user.roles.remove(role_to_remove)
     db.add(user)
     await db.commit()
@@ -449,7 +465,9 @@ async def get_weekly_attendance(
     result = await db.execute(
         select(EntryLog.timestamp).where(
             EntryLog.timestamp >= window_start,
-            EntryLog.access_granted == True
+            EntryLog.access_granted == True,
+            # Count entries only; EXIT scans would double the traffic.
+            EntryLog.action_type == "ENTRY"
         )
     )
 

@@ -422,3 +422,60 @@ def clear_user_name():
             await session.commit()
 
     return _clear
+
+
+@pytest.fixture
+def read_entry_logs():
+    """
+    Reads a member's entry_logs rows straight from the database, oldest first.
+
+    The desk and turnstile endpoints answer with a message, not with the row they
+    wrote, so "was the location stored" and "was nothing logged" can only be
+    answered by looking at the table. Returns plain dicts for the same reason
+    subscription_by_stripe_id does.
+    """
+    async def _read(user_id: int) -> list[dict]:
+        async with TestingSessionLocal() as session:
+            result = await session.execute(
+                select(EntryLog).where(EntryLog.user_id == user_id).order_by(EntryLog.id)
+            )
+            return [
+                {
+                    "action_type": log.action_type,
+                    "access_granted": log.access_granted,
+                    "location_id": log.location_id,
+                    "reason": log.reason,
+                }
+                for log in result.scalars().all()
+            ]
+
+    return _read
+
+
+@pytest.fixture
+def insert_bare_plan():
+    """
+    Inserts a plan row WITHOUT naming is_active and returns what the database kept.
+
+    Going through the ORM would apply the Python-side default and hide whether the
+    column has a server-side one; a Core insert leaves the column out entirely, the
+    way an old row or a hand-written INSERT does. An explicit NULL is also possible
+    here, to prove the NOT NULL constraint refuses it.
+    """
+    async def _insert(**extra):
+        async with TestingSessionLocal() as session:
+            await session.execute(
+                SubscriptionPlan.__table__.insert().values(
+                    name=f"Bare Plan {uuid.uuid4().hex[:6]}",
+                    price=1000,
+                    duration_days=30,
+                    **extra,
+                )
+            )
+            await session.commit()
+            result = await session.execute(
+                select(SubscriptionPlan.is_active).order_by(SubscriptionPlan.id.desc()).limit(1)
+            )
+            return result.scalar()
+
+    return _insert

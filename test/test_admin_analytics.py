@@ -431,3 +431,71 @@ async def test_admin_search_escapes_wildcards():
 
         finally:
             app.dependency_overrides.pop(get_current_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_entries_today_and_weekly_ignore_exit_scans(seed_entry_logs):
+    """
+    REGRESSION TEST: an EXIT scan is a granted log too. Both "entries today" and the
+    weekly chart filtered only on access_granted, so every visit (one ENTRY, one
+    EXIT) counted twice and traffic looked doubled.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        member_id, _ = await _register(ac, "Visit", "Twice")
+        today_name = to_gym_time(datetime.now(timezone.utc)).strftime("%a")
+
+        try:
+            app.dependency_overrides[get_current_admin] = override_get_current_admin
+
+            before_today = (await ac.get("/api/admin/analytics/today")).json()
+            before_week = {r["day"]: r["entries"] for r in (await ac.get("/api/admin/analytics/weekly")).json()}
+
+            now = datetime.now(timezone.utc)
+            await seed_entry_logs([
+                {"user_id": member_id, "access_granted": True, "action_type": "ENTRY",
+                 "timestamp": now - timedelta(seconds=30)},
+                {"user_id": member_id, "access_granted": True, "action_type": "EXIT",
+                 "timestamp": now - timedelta(seconds=10)},
+            ])
+
+            after_today = (await ac.get("/api/admin/analytics/today")).json()
+            after_week = {r["day"]: r["entries"] for r in (await ac.get("/api/admin/analytics/weekly")).json()}
+
+            assert after_today["total_successful_entries_today"] \
+                   - before_today["total_successful_entries_today"] == 1
+            assert after_week[today_name] - before_week[today_name] == 1
+
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_finances_counts_a_member_with_two_active_rows_once(seed_subscription):
+    """
+    REGRESSION TEST: active_subscriptions counted rows, so a member holding two
+    active rows was two "subscribers" and the conversion chart's "no subscription"
+    slice (total_users minus this) could go negative. It counts members now.
+    """
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        member_id, _ = await _register(ac, "Double", "Pass")
+
+        try:
+            app.dependency_overrides[get_current_admin] = override_get_current_admin
+
+            before = (await ac.get("/api/admin/analytics/finances")).json()
+
+            await seed_subscription(member_id)
+            await seed_subscription(member_id)
+
+            after = (await ac.get("/api/admin/analytics/finances")).json()
+
+            assert after["active_subscriptions"] - before["active_subscriptions"] == 1
+            # MRR still sums per row: both passes are real revenue
+            assert after["mrr"] - before["mrr"] == pytest.approx(6000)
+
+        finally:
+            app.dependency_overrides.pop(get_current_admin, None)

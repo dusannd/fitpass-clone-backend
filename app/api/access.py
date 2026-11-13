@@ -13,7 +13,7 @@ from app.core.redis_client import redis_db
 from app.core.websockets import ws_manager
 
 from app.models.access import EntryLog
-from app.models.subscription import UserSubscription, SubscriptionPlan, SubscriptionRule, plan_locations
+from app.models.subscription import UserSubscription, SubscriptionPlan, SubscriptionRule, GymLocation, plan_locations
 from app.schemas.access import QRTokenResponse, ScanRequest, ScanResponse, GenerateQRRequest
 from app.api.dependencies import RequireRole, decode_session_token
 from app.api.entry_policy import check_entry_policy
@@ -168,6 +168,13 @@ async def scan_qr_code(
     Turnstile scanner endpoint. Validates QR, checks Anti-Passback, burns the JTI, and logs it.
     """
     now = datetime.now(timezone.utc)
+
+    # 0. UNKNOWN LOCATION. A deleted gym or a stale kiosk URL used to sail through
+    # every check and then die on the entry_logs foreign key with a 500, after the
+    # code was burned. Refusing here - before the jti burn and before any log row -
+    # means the same QR still works once the scanner points at a real gym.
+    if await db.get(GymLocation, payload.location_id) is None:
+        raise HTTPException(status_code=404, detail="Gym location not found")
 
     # 1. DECODE & EXTRACT METADATA
     try:
