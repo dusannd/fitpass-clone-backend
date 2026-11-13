@@ -15,8 +15,10 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: str = ""
 
     # --- NEW: URL & CORS SETTINGS ---
-    # Fallback to localhost if not provided in .env
-    FRONTEND_URL: str = "http://localhost:5173"
+    # Fallback to the local dev server if not provided in .env. It is https because
+    # the Vite dev server only listens on https (the QR scanner needs the camera) -
+    # an http:// link to that port does not open, even on the machine running it.
+    FRONTEND_URL: str = "https://localhost:5173"
     # Note: Pydantic parses comma-separated strings into lists automatically if defined as list
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 

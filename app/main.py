@@ -40,6 +40,11 @@ async def lifespan(app: FastAPI):
     # credentials happen to be in .env - a missing email is otherwise indis-
     # tinguishable from a provider that was never picked in the first place.
     print(f"Email provider: {describe_email_provider()}")
+    # Printed for the same reason. Every verification and reset link is built from
+    # FRONTEND_URL, and a wrong value (a dead tunnel address, or the localhost
+    # default) still sends the mail - it just points somewhere the reader's phone
+    # cannot open. Only the person who registered ever sees that, so show it here.
+    print(f"Email links point at: {settings.FRONTEND_URL}")
     start_scheduler()
     await check_redis_connection()
 
